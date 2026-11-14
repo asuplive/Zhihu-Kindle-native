@@ -162,6 +162,21 @@ static void on_fatal(int sig, siginfo_t *si, void *uc_) {
                      "*** CRASH sig=%d (%s) addr=%p pc=%08lx lr=%08lx sp=%08lx ver=%s\n",
                      sig, nm, si ? si->si_addr : (void *)0, pc, lr, sp, ZH_VERSION);
     if (n > 0) crash_log(buf, n);
+    /* 1.2.10：崩溃也要把 framework 恢复掉（如果是我们停的）——
+     * cvm 死着 + 进程死了 = 没人喂看门狗，宽限期后整机重启，
+     * 用户连崩溃日志都来不及看。fork+execvp 在信号处理器里不严格
+     * async-signal-safe，但此时进程已注定退出，能救回 cvm 就是赚。 */
+    {
+        char p[320];
+        snprintf(p, sizeof(p), "%s/.framework_stopped", zh_home());
+        struct stat st;
+        if (stat(p, &st) == 0) {
+            unlink(p);
+            const char *msg = "framework 是我们停的，崩溃退出前补一次 start\n";
+            crash_log(msg, (int)strlen(msg));
+            run_quiet("/etc/init.d/framework", "start", NULL, NULL, NULL);
+        }
+    }
     _exit(128 + sig);
 }
 

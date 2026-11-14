@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.9"
+VER = "1.2.10"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -221,7 +221,10 @@ def main():
     # 1.2.9：状态栏开关、推荐条数、PNG/WebP、文章分目录缓存、Regal、
     #         旋转跟随、私信端点修正、KUAL 精简、标题只在第一页
     check("showbar" in uic, "ui.c 设置里有「系统状态栏」开关（showbar）")
-    check("showbar" in sh, "start.sh 读 showbar=0 接管系统界面")
+    check("showbar" in sh, "start.sh 读 showbar（1.2.10 起仅共存压屏，不再映射 framework=stop）")
+    check("showbar=0：隐藏顶栏=共存+压屏" in sh, "start.sh 不再因 showbar=0 杀 cvm（1.2.9 看门狗重启回归的修复）")
+    check(".want_stop" in sh and "自动升级 stop 已移除" in sh, "start.sh 已移除 .want_stop 自动升级 stop 机制")
+    check(".want_stop" not in uic or "已废弃" in uic, "ui.c 不再写 .want_stop（1.2.10 不主动请求杀 cvm）")
     check("g_cfg.rec" in uic and "rec=%d" in uic, "ui.c 推荐条数 6/12/18 可配置并写回 config")
     check("limit=%d" in api.replace("%", "%") or "limit=%d" in api, "api.c 推荐接口支持自定义 limit")
     check("stbi_load_from_memory" in imgc, "img.c 支持 PNG/GIF/BMP（stb_image）")
@@ -242,6 +245,17 @@ def main():
     check("layout_build2" in uic, "ui.c 阅读页首页与后续页分开排（layout_build2）")
     check("layout_page_top" in uic, "ui.c 用 layout_page_top 换算页内位置")
     check(any("img_test_webp.h" in n for n in names_base(z, base)), "源码含 WebP 测试图头文件")
+
+    # 1.2.10：看门狗重启修复——showbar/framework 解耦、stop 兜底、
+    #          崩溃恢复 framework、SEND_UPDATE breadcrumb
+    check("stop_expire_loop" in sh, "start.sh stop 兜底：framework=stop 超时自动恢复共存")
+    check("fwback" in sh, "start.sh 兜底时长可配（fwback=，默认 600s）")
+    check(".stop_released" in sh, "start.sh 兜底恢复后停手（不再掐 cvm）")
+    check("framework 是我们停的" in mnc, "main.c 崩溃处理器 _exit 前恢复 framework")
+    check("即将 SEND_UPDATE" in fbc, "fb.c SEND_UPDATE 前写 breadcrumb（panic 定位）")
+    check("FBIOPAN_DISPLAY branch" in fbc and "#warning" in fbc, "fb.c FBIOPAN 分支编译期警示")
+    check("fw=%s" in uic, "ui.c 心跳带 framework 状态（fw=coexist/stop Ns）")
+    check('g_cfg.showbar = 1' in uic, "ui.c showbar 默认值改回 1（显示/共存）")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

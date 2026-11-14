@@ -43,10 +43,10 @@ typedef struct {
      * 必须原样透传——config_save 会整份重写文件，不带上它的话，
      * 用户改一次字号就把这行冲掉了，下次启动又退回到会重启的刷新路径。 */
     char refresh[8];
-    /* 1.2.9：showbar=0 表示隐藏 Kindle 系统顶栏（时间/网络/电量）——
-     * 顶栏是 cvm 画的，隐藏它等于接管系统界面（framework=stop），
-     * start.sh 读这个键决定要不要停。默认 0：用户反馈顶栏和翻页键串扰
-     * 都来自共存模式。showbar=1 恢复共存。 */
+    /* 1.2.10：showbar 与 framework 彻底解耦。顶栏（时间/网络/电量）是
+     * cvm 画的，1.2.9 曾用"杀 cvm"来隐藏它——cvm 一死 framework 看门狗
+     * 就在宽限期后整机重启（真机实测两次）。现在 showbar=0 只表示
+     * "共存 + 屏幕守护压顶栏"，不再碰 framework。默认 1（显示，推荐）。 */
     int showbar;
     /* 推荐列表条数：6/12/18（6 的倍数，最多 18） */
     int rec;
@@ -219,7 +219,7 @@ int ui_config_roundtrip_test(void) {
     g_cfg.images = 0;
     g_cfg.margin_pct = 7;
     g_cfg.refresh[0] = 0;
-    g_cfg.showbar = 0;
+    g_cfg.showbar = 1;   /* 1.2.10：默认显示（共存）。1.2.9 默认 0 曾触发看门狗重启 */
     g_cfg.rec = 6;
     return loaded && kept;
 }
@@ -332,7 +332,7 @@ typedef struct {
     uint32_t   screen_sig;
     long       guard_ms;
     long       guard_first;    /* 第一次被抢屏的时刻（判断"持续抢"） */
-    int        stop_req;       /* 已经请求过停止系统界面 */
+    int        stop_req;       /* （1.2.10 已废弃）曾经请求过停止系统界面 */
     long       grab_ms;
     long       msg_until;     /* 自动关闭的提示（触摸可能不通时不能弹模态） */       /* 补抢触摸独占的节流 */
     int        guard_hits;    /* 屏幕被抢过几次 */
@@ -1013,7 +1013,7 @@ static void draw_settings(void) {
     snprintf(vals[3], sizeof(vals[3]), "%s", imgmodes[g_cfg.images]);
     snprintf(vals[4], sizeof(vals[4]), "%d%%", g_cfg.margin_pct);
     snprintf(vals[5], sizeof(vals[5]), "%d 条", g_cfg.rec);
-    snprintf(vals[6], sizeof(vals[6]), "%s", g_cfg.showbar ? "显示（共存）" : "隐藏（推荐）");
+    snprintf(vals[6], sizeof(vals[6]), "%s", g_cfg.showbar ? "显示（推荐）" : "隐藏（压屏）");
     snprintf(vals[7], sizeof(vals[7]), "重新分页");
     snprintf(vals[8], sizeof(vals[8]), "含图片缓存");
     vals[9][0] = 0;
@@ -3028,19 +3028,18 @@ static void handle_tap(int x, int y) {
                 g_cfg.rec = (g_cfg.rec == 6) ? 12 : (g_cfg.rec == 12 ? 18 : 6);
                 config_save();
             } else if (i == 6) {
-                /* 系统状态栏：隐藏 = 接管系统界面（framework=stop），
-                 * 顶栏的时间/网络/电量不再盖到我们的界面上，
-                 * 物理翻页键也不会再串到 Kindle 书城/搜索框。
-                 * 生效要等下次从 KUAL 重新打开（start.sh 读 config）。 */
+                /* 1.2.10：系统状态栏与 framework 解耦。隐藏=共存+屏幕守护
+                 * 压顶栏（顶栏偶尔闪现，秒级被回灌压掉），不再杀 cvm——
+                 * 1.2.9 的 framework=stop 被 framework 看门狗判死、
+                 * 宽限期后整机重启。重启程序后生效（start.sh 读 config）。 */
                 g_cfg.showbar = g_cfg.showbar ? 0 : 1;
                 config_save();
                 if (g_cfg.showbar == 0)
-                    show_message("系统状态栏：隐藏。\n\nKindle 顶栏的时间/网络/电量不再显示，"
-                                 "物理翻页键也不会再串出书城内容。\n\n"
-                                 "**退出本应用并从 KUAL 重新打开后生效**\n"
-                                 "（启动器要按新配置接管系统界面）。");
+                    show_message("系统状态栏：隐藏（压屏）。\n\n顶栏的时间/网络/电量出现后\n"
+                                 "会被屏幕守护自动压掉（几秒内）。\n不杀系统界面，不会触发整机重启。\n\n"
+                                 "退出本应用并从 KUAL 重新打开后生效。");
                 else
-                    show_message("系统状态栏：显示。\n\n与 Kindle 系统界面共存，"
+                    show_message("系统状态栏：显示（推荐）。\n\n与 Kindle 系统界面共存，"
                                  "顶栏偶尔会盖到画面上。\n退出并重新打开后生效。");
                 return;
             } else if (i == 7) {
@@ -3656,19 +3655,10 @@ int app_run(void) {
                                    restored == 0 ? "影子回灌" : "整页重画",
                                    g.scr, g.guard_hits);
 
-                        /* 一直抢就说明 cvm 在持续画（时钟、通知）。与其每 120ms
-                         * 跟它抢一次，不如请启动器把系统界面停掉——写一个标记，
-                         * start.sh 的 5 秒心跳会看到并执行 framework stop。
-                         * 只请求一次，退出时照旧还原。 */
-                        if (!g.stop_req && g.guard_hits >= 8 &&
-                            now - g.guard_first < 60000) {
-                            g.stop_req = 1;
-                            char p[320];
-                            snprintf(p, sizeof(p), "%s/.want_stop", zh_home());
-                            if (write_file_atomic(p, "1\n", 2) == 0)
-                                logmsg("屏幕守护: cvm 持续抢屏 %d 次，已请求启动器停掉系统界面",
-                                       g.guard_hits);
-                        }
+                        /* 1.2.10：被抢只回灌，不再"请求启动器停系统界面"——
+                         * 1.2.9 时代的 .want_stop 自动升级会让 cvm 死掉，
+                         * framework 看门狗宽限期后整机重启（真机两次）。
+                         * 抢屏由上面的影子回灌/整页重画自己解决。 */
 
                         if (guard_streak >= 3) {
                             guard_hold = now_ms_ui() + 3000;
@@ -3733,12 +3723,28 @@ int app_run(void) {
                  * 还是进了但排版结果为空，看这两个值就能区分。
                  * 触摸计数和抢屏次数也带上：下次"点不动"能一眼分成
                  * "没收到事件"和"收到了但没处理"。 */
+                /* 1.2.10：framework 状态进心跳——真机日志"戛然而止"（无
+                 * *** CRASH 也无正常退出）就是被 framework 看门狗 SIGKILL，
+                 * 看这行就知道当时是不是 stop 模式、停了多久。 */
+                char fwbuf[48];
+                {
+                    char pp[320];
+                    struct stat fst;
+                    snprintf(pp, sizeof(pp), "%s/.framework_stopped", zh_home());
+                    if (stat(pp, &fst) == 0) {
+                        long stopped = (long)time(NULL) - (long)fst.st_mtime;
+                        if (stopped < 0) stopped = 0;
+                        snprintf(fwbuf, sizeof(fwbuf), "stop %lds", stopped);
+                    } else {
+                        snprintf(fwbuf, sizeof(fwbuf), "coexist");
+                    }
+                }
                 logmsg("心跳 scr=%d 页=%d/%d 列表=%d 登录=%d 内存=%ldKB 挂起=%lds "
-                       "刷新=%d eips=%d/%d 触摸=%ld 点击=%ld 抢屏=%d 开机=%lds",
+                       "刷新=%d eips=%d/%d 触摸=%ld 点击=%ld 抢屏=%d 开机=%lds fw=%s",
                        g.scr, g.page + 1, g.lay.npages, g.list.n, account_has_login(),
                        rss, sleep_seen, g.fb.eink_kind, g.fb.eips_ok, g.fb.eips_fail,
                        input_event_count(), input_action_count(), g.guard_hits,
-                       sys_uptime_sec());
+                       sys_uptime_sec(), fwbuf);
             }
             continue;
         }

@@ -175,6 +175,27 @@ kmsg_loop() {
 
 CF_MODE=$(cfg_get framework auto)
 FROZEN_FILE="$DATA/.cvm_frozen"
+# 1.2.10：stop 兜底（防止 framework 看门狗因 cvm 长期死亡而整机重启）
+FWBACK=$(cfg_get fwback 600)
+RELEASED="$DATA/.stop_released"
+
+# framework=stop 持续超过 fwback 秒就主动恢复，退回共存模式。
+# 以 $STOPPED 标记的 mtime 为 stop 生效时刻。
+stop_expire_loop() {
+    while :; do
+        sleep 10
+        [ -f "$RELEASED" ] && return 0
+        ST=$(stat -c %Y "$STOPPED" 2>/dev/null) || return 0
+        NOW=$(date +%s)
+        if [ -n "$ST" ] && [ $((NOW - ST)) -ge "$FWBACK" ]; then
+            touch "$RELEASED" 2>/dev/null
+            rm -f "$STOPPED"
+            log "stop 兜底：framework 已停 ${FWBACK}s，为避免看门狗整机重启，恢复 framework（顶栏由屏幕守护压回）"
+            [ -x /etc/init.d/framework ] && /etc/init.d/framework start
+            return 0
+        fi
+    done
+}
 
 cvm_state() {   # cvm_state <pid> -> R/S/T/Z/?
     # 直接读 /proc/<pid>/stat 的第三个字段（进程状态），不用 fork sed——
@@ -257,16 +278,20 @@ WANT_STOP="$DATA/.want_stop"
 guard_framework() {
     case "$CF_MODE" in
     none)
-        # 共存模式下程序会自己抢屏（影子回灌）。如果 cvm 一直画个不停
-        # （顶栏时钟每分钟一次、通知、封面），程序点 8 次以上就会写这个标记，
-        # 请我们把系统界面停掉。只认一次，退出时照旧 framework start。
+        # 1.2.10：不再因"程序报告抢屏"自动切 stop——杀 cvm 会触发 framework
+        # 看门狗整机重启。抢屏由程序内的屏幕守护（影子回灌）自己解决。
+        # 1.2.9 及以前写的 .want_stop 残留在这里清掉即可，不再生效。
         [ -f "$WANT_STOP" ] || return 0
         rm -f "$WANT_STOP"
-        log "程序报告 cvm 持续抢屏 -> 切换到 stop 接管（退出时会启动回来）"
-        CF_MODE=stop
-        stop_framework
+        log "发现 .want_stop 残留（1.2.9 及以前的自动升级 stop 已移除），已清除；保持共存"
         ;;
     stop)
+        # 1.2.10：stop 兜底已恢复过 framework（.stop_released）就退回共存，
+        # 不再继续掐 cvm——init 会把它拉起来，让系统界面自然回来。
+        if [ -f "$RELEASED" ]; then
+            CF_MODE=none
+            return 0
+        fi
         P=$(cvm_pid)
         [ -n "$P" ] || return 0
         if kill -9 "$P" 2>/dev/null; then
@@ -293,6 +318,13 @@ guard_framework() {
 }
 
 restore_framework() {
+    # 1.2.10：stop 兜底已经恢复过 framework，就不在这里重复 start
+    # （重复 start 可能起两个 cvm，比不启动更糟）。
+    if [ -f "$RELEASED" ]; then
+        rm -f "$RELEASED"
+        log "恢复：stop 兜底已 framework start，这里不再重复"
+        return 0
+    fi
     # 被动接管（none -> stop）时 CF_MODE 的改动发生在后台心跳的 subshell 里，
     # 主 shell 这边还是 none，但不代表没停过——以标记文件为准，先处理它。
     if [ "$CF_MODE" != "stop" ] && [ -f "$STOPPED" ]; then
@@ -329,6 +361,7 @@ cleanup() {
     rm -f "$WANT_STOP"
     release_wake
     [ -n "$KEEP_PID" ] && kill $KEEP_PID 2>/dev/null
+    [ -n "$EXPIRE_PID" ] && kill $EXPIRE_PID 2>/dev/null
     [ -n "$KMSG_PID" ] && kill $KMSG_PID 2>/dev/null
     lipc-set-prop -i com.lab126.powerd preventScreenSaver 0 2>/dev/null
     restore_framework
@@ -414,16 +447,13 @@ spy)
     log_boot_state
 
     # 探测必须在动 framework 之前：探测结果决定要不要动它
-    # 1.2.9：showbar=0（隐藏系统状态栏，默认值）——顶栏的时间/网络/电量是
-    # cvm 画的，物理翻页键串出书城/搜索框也是 cvm 在响应。隐藏它们唯一的
-    # 干净办法就是接管系统界面（framework=stop），退出时照常恢复。
-    # 只有用户显式写 framework=none 时才尊重共存（两个要求冲突时明说）。
-    SB=$(cfg_get showbar 0)
-    if [ "$SB" = "0" ] && [ "$CF_MODE" = "auto" ]; then
-        log "showbar=0：隐藏系统状态栏/翻页键串扰，接管系统界面（framework=stop）"
-        CF_MODE=stop
-    elif [ "$SB" = "0" ] && [ "$CF_MODE" = "none" ]; then
-        log "showbar=0 但用户显式写了 framework=none：保持共存，顶栏可能仍会出现"
+    # 1.2.10：showbar 与 framework 彻底解耦（1.2.9 的教训：showbar=0 时杀 cvm，
+    # framework 看门狗在宽限期后整机重启，run.log 用 boot_id 自证了两次）。
+    # showbar=0（隐藏顶栏）不再碰 cvm：共存模式 + 程序内屏幕守护（影子回灌，
+    # 120ms 一拍）把顶栏残留压回去。顶栏可能偶尔闪现，几秒内被压回。
+    SB=$(cfg_get showbar 1)
+    if [ "$SB" = "0" ]; then
+        log "showbar=0：隐藏顶栏=共存+压屏（1.2.10 起不杀 cvm，避免 framework 看门狗整机重启）"
     fi
     resolve_mode
     log "config: framework=$CF_MODE（原始值 $(cfg_get framework auto)）refresh=$(cfg_get refresh auto) eips=$(cfg_get eips auto) showbar=$SB rec=$(cfg_get rec 6)"
@@ -461,6 +491,17 @@ spy)
     # 4) 每 5 秒补一次防休眠，并守住"cvm 别被拉回来抢屏"
     keepawake_loop >/dev/null 2>&1 &
     KEEP_PID=$!
+
+    # 5) 1.2.10：stop 模式兜底——cvm 死太久会触发 framework 看门狗整机重启
+    #    （1.2.9 真机实测，宽限期几十秒到几分钟不等）。显式 framework=stop
+    #    （或 auto 探测到 busy）时，持续超过 fwback 秒就主动恢复 framework
+    #    回到共存，顶栏由程序内屏幕守护压回。fwback=0 关闭兜底。
+    if [ "$CF_MODE" = "stop" ] && [ "$FWBACK" -gt 0 ] 2>/dev/null; then
+        rm -f "$RELEASED"
+        stop_expire_loop >/dev/null 2>&1 &
+        EXPIRE_PID=$!
+        log "stop 兜底已启动：framework=stop 持续超过 ${FWBACK}s 自动恢复共存（config.txt 写 fwback=0 关闭）"
+    fi
 
     "$APP" >> "$LOG" 2>&1
     rc=$?

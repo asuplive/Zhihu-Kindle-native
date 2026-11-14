@@ -93,7 +93,13 @@ static unsigned int ioc_dir(unsigned int dir, unsigned int type,
  * 保证"最后一行"一定落盘，用来区分是「写内存时崩」还是「ioctl 触发 panic」。
  * 只在前几次 present 记，避免翻页时反复 fsync 拖慢。 */
 static void fb_trace(Fb *fb, const char *fmt, ...) {
-    if (fb->trace_n <= 0) return;
+    if (fb->trace_n <= 0) {
+        /* 1.2.10：MXCFB 分支不限量——内核 panic 捕不到、不留 *** CRASH，
+         * 只能靠 panic 前最后一行定位是哪个刷新参数作的妖。
+         * 每页一行小 append 对 flash 的磨损与 KOReader 相当，可接受。 */
+        if (fb->eink_kind != 1) return;
+        fb->trace_n = 1;
+    }
     fb->trace_n--;
     char path[600];
     snprintf(path, sizeof(path), "%s/fb_trace.log", zh_home());
@@ -893,8 +899,13 @@ void fb_present(Fb *fb, int full) {
         b[7] = (uint32_t)fb->update_temp;     /* temp：探测时确认过的那档 */
 
         /* 不阻塞等待完成：等的话一旦驱动不返回，整机就卡在这儿，
-         * 看起来跟"闪退/死机"一模一样。异步提交由驱动排队即可。 */
+         * 看起来跟"闪退/死机"一模一样。异步提交由驱动排队即可。
+         * 1.2.10：发送前先写 breadcrumb（即将发送的波形/模式/区域）——
+         * 内核 panic 不经过用户态信号处理，log.txt 会戛然而止，
+         * fb_trace.log 的最后一行就是嫌疑参数。 */
         long t0 = fb_now_ms();
+        fb_trace(fb, "即将 SEND_UPDATE wave=%u mode=%u 区域=%ux%d marker=%u",
+                 wave, b[5], (unsigned)aw, (unsigned)fb->height, fb->marker);
         errno = 0;
         int r = ioctl(fb->fd, fb->send_update_ioctl, b);
         int e = errno;
@@ -949,7 +960,11 @@ void fb_present(Fb *fb, int full) {
 
     if (fb->eink_kind == 2) {
         /* 老驱动（K4/K5）：写内存本身就会触发刷新；
-         * 再补一次 FBIOPAN_DISPLAY，部分固件靠它才会真正刷屏 */
+         * 再补一次 FBIOPAN_DISPLAY，部分固件靠它才会真正刷屏。
+         * ⚠ 编译期警示：这一支绝不允许在 KO3/KO3-类 i.MX6 EPDC 机器上
+         * 被走到——FBIOPAN_DISPLAY 在双缓冲屏上会内核 panic 整机重启
+         * （1.2.2 事故）。探测层（eink_kind 的取值）是唯一的闸门。 */
+#warning "FBIOPAN_DISPLAY branch: KO3-class devices kernel-panic here. eink_kind==2 is K4/K5 only — keep the probe gate intact."
         struct fb_var_screeninfo var;
         if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &var) == 0) {
             var.activate = FB_ACTIVATE_NOW;
