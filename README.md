@@ -16,7 +16,7 @@
 
 | 文件 | 用途 |
 |---|---|
-| `知乎阅读-Kindle-1.2.9.zip` | 完整安装包：程序 + KUAL 菜单 + 启动脚本 + 全部文档与源码 |
+| `zhihu-Kindle-1.2.9.zip` | 完整安装包：程序 + KUAL 菜单 + 启动脚本 + 全部文档与源码 |
 | `zhihu` | ARM 静态可执行文件本体（仅调试/手动替换用） |
 
 安装：解压后把 `extensions/zhihureader` 整个目录复制到 Kindle 的 `/mnt/us/extensions/`，KUAL →「知乎阅读」→「安装 / 更新程序」→ 点「知乎阅读」启动。详见压缩包里的 `安装说明.txt`。
