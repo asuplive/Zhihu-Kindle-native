@@ -253,11 +253,15 @@ void layout_build2(Layout *L, const Doc *doc, int width, int height, int base_px
     }
 
     /* 分页：页起点在排版的 ADV_PAGE() 里逐页记录。
-     * 第一页页高是 first_h（有标题页眉），后面每页都是 height。 */
-    L->npages = pn + 1;
-    L->pages = xcalloc((size_t)L->npages + 1, sizeof(int));
+     * 第一页页高是 first_h（有标题页眉），后面每页都是 height。
+     * 1.2.11 修复：之前写成 npages = pn + 1，而 pages[pn] 从未赋值
+     * （calloc 为 0），导致最后两页一行区间为空/全部越页——真机上
+     * 表现为"共 5 页的第 4、5 页全空白；共 2 页的两页全空白"。
+     * 排版记录了 pn 个页起点，内容就占 pn 页，第 pn 页结束于 L->n。 */
+    L->npages = pn;
+    L->pages = xcalloc((size_t)pn + 1, sizeof(int));
     for (int p = 0; p < pn; p++) L->pages[p] = pstarts[p];
-    L->pages[L->npages] = L->n;
+    L->pages[pn] = L->n;
     free(pstarts);
 #undef ADV_PAGE
 }

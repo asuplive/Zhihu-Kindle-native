@@ -493,7 +493,7 @@ static int parse_one(JVal *item, ApiItem *it) {
         JVal *ta = json_get(t, "title_area");
         if (ta) title = json_get_str(ta, "text", NULL);
     }
-    char excerpt_buf[640];
+    char excerpt_buf[1024];
     excerpt_buf[0] = 0;
     if (!title || !*title) {
         const char *ex = json_get_str(t, "excerpt", NULL);
@@ -502,7 +502,9 @@ static int parse_one(JVal *item, ApiItem *it) {
             if (ea) ex = json_get_str(ea, "text", NULL);
         }
         if (!ex) ex = json_get_str(t, "content", NULL);   /* 回答的正文 HTML */
-        if (ex && *ex) html_plain(ex, excerpt_buf, sizeof(excerpt_buf), 46);
+        /* 1.2.11：140 字。回答列表每条要露前三行预览（每行约 30 字），
+         * 46 字连两行都不够。其余有标题的列表不走这个分支，不受影响。 */
+        if (ex && *ex) html_plain(ex, excerpt_buf, sizeof(excerpt_buf), 140);
         if (excerpt_buf[0]) title = excerpt_buf;
     }
     if (!title || !*title) {

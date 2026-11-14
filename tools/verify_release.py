@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.10"
+VER = "1.2.11"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -256,6 +256,22 @@ def main():
     check("FBIOPAN_DISPLAY branch" in fbc and "#warning" in fbc, "fb.c FBIOPAN 分支编译期警示")
     check("fw=%s" in uic, "ui.c 心跳带 framework 状态（fw=coexist/stop Ns）")
     check('g_cfg.showbar = 1' in uic, "ui.c showbar 默认值改回 1（显示/共存）")
+
+    # 1.2.11：真机三修——排版空页、标题折行、回答列表三行预览
+    layc = z.read(base + "source/src/layout.c").decode("utf-8", "replace")
+    apic = z.read(base + "source/src/api.c").decode("utf-8", "replace")
+    check("L->npages = pn;" in layc and "L->pages[pn] = L->n;" in layc,
+          "layout.c 修复 pages[pn] 未赋值导致的尾部空白页（1.2.11 主修）")
+    check("npages = pn + 1;" not in layc, "layout.c 已移除 npages 多算一页")
+    check("reader_title_layout" in uic and "READER_TITLE_MAX_LINES 3" in uic,
+          "ui.c 阅读页标题自动折行（最多 3 行，完整显示）")
+    check("g.base / 2 + g_title_lines * lh" in uic, "ui.c 页眉高度随标题行数自适应")
+    check("draw_wrapped_n" in uic and 'strcmp(g.list_kind, "answers") == 0' in uic,
+          "ui.c 回答列表每条 3 行摘要预览（行高自适应）")
+    check("max_chars), 140" in apic or ", 140)" in apic,
+          "api.c 回答摘要加长到 140 字（够三行预览）")
+    check("空页=" in mnc and "越页=" in mnc,
+          "main.c 自检 [lay2] 钉死空页/越页回归")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

@@ -384,6 +384,8 @@ static void qr_stop(void);
 static void qr_tick(void);
 static int  is_cjk_simple(uint32_t c);
 static int  draw_wrapped(int x, int y, int maxw, int px, const char *s, int gray, int maxy);
+static int  draw_wrapped_n(int x, int y, int maxw, int px, const char *s, int gray,
+                           int max_lines, int maxy);
 static void sim_seed_image(const char *url);
 
 static int is_cjk_simple(uint32_t c) {
@@ -619,7 +621,13 @@ static void draw_home(void) {
 
 /* ---------------- 屏幕：列表 ---------------- */
 
-static int list_row_h(void) { return g.base * 13 / 5; }
+static int list_row_h(void) {
+    /* 1.2.11：回答列表（点热榜问题后看到的那个列表）每条先露 3 行摘要
+     * 预览，行高比普通列表高一大截；其余列表保持原来的紧凑两行式 */
+    if (strcmp(g.list_kind, "answers") == 0)
+        return g.base * 6;
+    return g.base * 13 / 5;
+}
 static int list_rows_per_page(void) {
     int avail = g.H - g.header_h - g.footer_h;
     int n = avail / list_row_h();
@@ -657,17 +665,29 @@ static void draw_list(void) {
         int fg = sel ? 255 : 0;
         int fg2 = sel ? 200 : 110;
         int tpx = g.base;
-        int baseline = y + rh / 3;
         char num[16];
         snprintf(num, sizeof(num), "%d", idx + 1);
         int numw = font_width(tpx * 3 / 4, num, (int)strlen(num));
-        text_at(g.margin, baseline, tpx * 3 / 4, num, fg2, 0);
-        text_clip(g.margin + numw + g.base / 2, baseline, tpx, it->title,
-                  g.W - 2 * g.margin - numw - g.base / 2, fg, sel);
-        if (it->sub[0]) {
+        int tx = g.margin + numw + g.base / 2;
+        if (strcmp(g.list_kind, "answers") == 0) {
+            /* 1.2.11：回答列表——每条先露前三行摘要，看得到写得怎么样
+             * 再决定点不点进去；底部一行还是作者 · 赞同 */
             int spx = g.base * 3 / 5;
-            text_clip(g.margin + numw + g.base / 2, y + rh - spx, spx, it->sub,
-                      g.W - 2 * g.margin - numw, fg2, 0);
+            int ty = y + g.base / 2 + tpx;              /* 第一行 baseline */
+            draw_wrapped_n(tx, ty, g.W - g.margin - tx, tpx, it->title, fg,
+                           3, y + rh - spx - g.base);
+            if (it->sub[0])
+                text_at(tx, y + rh - g.base / 2 - spx, spx, it->sub, fg2, 0);
+        } else {
+            int baseline = y + rh / 3;
+            text_at(g.margin, baseline, tpx * 3 / 4, num, fg2, 0);
+            text_clip(tx, baseline, tpx, it->title,
+                      g.W - 2 * g.margin - numw - g.base / 2, fg, sel);
+            if (it->sub[0]) {
+                int spx = g.base * 3 / 5;
+                text_clip(tx, y + rh - spx, spx, it->sub,
+                          g.W - 2 * g.margin - numw, fg2, 0);
+            }
         }
         if (!sel) fb_hline(&g.fb, g.margin, y + rh - 1, g.W - 2 * g.margin, 220);
         y += rh;
@@ -717,11 +737,75 @@ static void draw_list(void) {
 static int reader_pad(void) { return g.base * 2 / 3; }
 
 /* 1.2.7：阅读页标题比列表页页眉明显大一档（粗体，1.2 倍正文）。
- * 页眉跟着加高，否则放大后的标题会压到正文第一行上。 */
-static int reader_header_h(void) { return g.base * 5 / 2; }
+ * 页眉跟着加高，否则放大后的标题会压到正文第一行上。
+ * 1.2.11：标题自动折行完整显示（原来一行截断加省略号，长标题
+ * 根本看不出问的是什么），最多 3 行，页眉高度跟着行数走。 */
+#define READER_TITLE_MAX_LINES 3
+static int g_title_lines = 1;
+static int g_title_more = 0;                        /* 折满 3 行仍有剩余 */
+static int g_title_seg[READER_TITLE_MAX_LINES][2];  /* 每行在 doc_title 里的字节区间 */
+
+static int reader_title_px(void) { return g.base * 6 / 5; }
+
+/* 标题可用宽度：右上角要给页码留位置 */
+static int reader_title_avail(void) {
+    int rpx = g.base * 3 / 4;
+    int reserve = rpx * 3 + g.margin;      /* "12/34" 一类页码 */
+    int avail = g.W - 2 * g.margin - reserve;
+    return avail > g.base * 4 ? avail : g.base * 4;
+}
+
+static void reader_title_layout(void) {
+    int px = reader_title_px();
+    int avail = reader_title_avail();
+    const char *s = g.doc_title;
+    int len = s ? (int)strlen(s) : 0;
+    int lines = 0, pos = 0;
+    while (pos < len && lines < READER_TITLE_MAX_LINES) {
+        int room = avail;
+        int i = pos, w = 0, last = -1;
+        uint32_t prev = 0;
+        if (lines == READER_TITLE_MAX_LINES - 1 &&
+            font_width(px, s + pos, len - pos) > avail)
+            room = avail - g.base;             /* 最后还剩内容时给"…"留位 */
+        while (i < len) {
+            uint32_t cp;
+            int n = u8_decode(s + i, (size_t)(len - i), &cp);
+            if (n <= 0) { n = 1; cp = (unsigned char)s[i]; }
+            int cw = font_width(px, s + i, n);
+            if (w + cw > room) break;
+            if (cp == ' ' || prev == ' ') last = i;   /* 词边界优先 */
+            w += cw;
+            prev = cp;
+            i += n;
+        }
+        int cut = (i >= len) ? len : (last > pos ? last : i);
+        if (cut <= pos) cut = pos + 1;         /* 单字超宽也至少推进一个字 */
+        g_title_seg[lines][0] = pos;
+        g_title_seg[lines][1] = cut;
+        lines++;
+        pos = cut;
+        while (pos < len && s[pos] == ' ') pos++;
+    }
+    if (lines <= 0) {
+        lines = 1;
+        g_title_seg[0][0] = 0;
+        g_title_seg[0][1] = len;
+    }
+    g_title_more = (pos < len);
+    g_title_lines = lines;
+}
+
+static int reader_header_h(void) {
+    int px = reader_title_px();
+    int lh = px + px / 4;
+    return g.base / 2 + g_title_lines * lh + g.base / 2;
+}
 
 static void reader_layout(void) {
     layout_free(&g.lay);
+    /* 1.2.11：先按当前宽度折好标题行数（h0 依赖页眉高度），再排版 */
+    reader_title_layout();
     int w = g.W - 2 * g.margin;
     /* 底部多留 base/3：排版高度刚好卡到页脚时，最后一行的字身会压到
      * 页脚横线上（看上去像"被裁掉半行"）。留出下伸部的高度就没有这问题。 */
@@ -777,6 +861,7 @@ static void reader_relayout_keep(void) {
 /* 阅读页页眉：标题大号加粗，右上角仍显示页码。
  * 1.2.9：只在第一页画标题；后续页顶部只留一条细分隔线，正文更长。 */
 static void draw_reader_header(const char *title, const char *right, int page) {
+    (void)title;   /* 1.2.11：标题折行信息在 g_title_* 里，直接用 g.doc_title */
     int h = reader_header_h();
     if (page > 0) {
         /* 后续页：没有标题。顶部只画一条浅线，右上角小字页码。 */
@@ -790,13 +875,20 @@ static void draw_reader_header(const char *title, const char *right, int page) {
         return;
     }
     fb_fill(&g.fb, 0, 0, g.W, h + 1, 255);
-    int px = g.base * 6 / 5;
+    /* 1.2.11：标题折行完整显示（reader_layout 里已按宽度折好行） */
+    int px = reader_title_px();
     int rpx = g.base * 3 / 4;
-    int rw = 0;
-    if (right && *right) rw = font_width(rpx, right, (int)strlen(right)) + g.margin;
-    int baseline = h - px / 2 - 2;
-    if (baseline < px) baseline = px;
-    text_clip(g.margin, baseline, px, title, g.W - 2 * g.margin - rw, 0, 1);
+    int lh = px + px / 4;
+    int lastw = 0, lastbase = 0;
+    for (int i = 0; i < g_title_lines; i++) {
+        int seglen = g_title_seg[i][1] - g_title_seg[i][0];
+        lastbase = g.base / 2 + i * lh + px;
+        font_draw(&g.fb, g.margin, lastbase, px,
+                  g.doc_title + g_title_seg[i][0], seglen, 0, 1);
+        lastw = font_width(px, g.doc_title + g_title_seg[i][0], seglen);
+    }
+    if (g_title_more && g_title_lines > 0)
+        text_at(g.margin + lastw + g.base / 4, lastbase, px, "…", 0, 1);
     if (right && *right) {
         int w = font_width(rpx, right, (int)strlen(right));
         text_at(g.W - g.margin - w, h - rpx / 2 - 3, rpx, right, 110, 0);
@@ -1100,12 +1192,22 @@ static void draw_about(void) {
  * 断行规则和消息屏（原 draw_message 内联实现）完全一致：
  * 支持手动换行、优先在空格/中文/ASCII 标点处断，行首行尾空格不画。 */
 static int draw_wrapped(int x, int y, int maxw, int px, const char *s, int gray, int maxy) {
+    return draw_wrapped_n(x, y, maxw, px, s, gray, 0, maxy);
+}
+
+/* 1.2.11：带行数上限的折行（max_lines<=0 不限）。回答列表预览用：
+ * 每条回答先露前三行，够了再点进去。 */
+static int draw_wrapped_n(int x, int y, int maxw, int px, const char *s, int gray,
+                          int max_lines, int maxy) {
     if (!s || !*s) return y;
     int lh = px * 3 / 2;
     if (lh < 1) lh = 1;
     const char *p = s;
+    int drawn = 0;
     while (*p) {
         if (y > maxy) break;
+        if (max_lines > 0 && drawn >= max_lines) break;
+        drawn++;
         int len = (int)strlen(p);
         int i = 0, last = 0, width = 0, hard_nl = 0;
         while (i < len) {

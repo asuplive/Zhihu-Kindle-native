@@ -816,7 +816,7 @@ static int run_selftest(void) {
             Doc d;
             doc_init(&d);
             char para[512];
-            for (int i = 0; i < 12; i++) {
+            for (int i = 0; i < 20; i++) {
                 snprintf(para, sizeof(para), "第%d段，这一段有比较多的汉字内容，"
                                              "用来把排版撑过好几页。", i);
                 doc_add(&d, para, BLK_PARA);
@@ -833,10 +833,25 @@ static int run_selftest(void) {
                     if (i >= L.pages[q] && i < L.pages[q + 1]) { pg = q; break; }
                 if (pg == 0 && L.lines[i].y >= h0) p0 = 0;
                 if (pg == 1 && (L.lines[i].y < h0 || L.lines[i].y >= h0 + h1)) p1 = 0;
+                if (pg < 0) p0 = p1 = 0;   /* 每一行都必须归属某个页 */
             }
-            ok = okp && p0 && p1;
-            printf("[lay2 ] %s 首页高 %d、后续页高 %d，页数=%d，各页行不越界\n",
-                   ok ? "OK" : "FAIL", h0, h1, L.npages);
+            /* 1.2.11 回归：1.2.9/1.2.10 的 pages[pn] 从未赋值（calloc 为 0），
+             * npages 又多算一页——真机上"共 5 页的第 4、5 页全空白、
+             * 共 2 页的两页全空白"。这里钉死：每一页行区间非空，
+             * 且每页首行的 y 落在该页自己的 y 区间里。 */
+            int empty = 0, off = 0;
+            for (int q = 0; q < L.npages; q++) {
+                if (L.pages[q] >= L.pages[q + 1]) { empty++; continue; }
+                int top = (q == 0) ? 0 : h0 + (q - 1) * h1;
+                int ph  = (q == 0) ? h0 : h1;
+                int fy = L.lines[L.pages[q]].y;
+                if (fy < top || fy >= top + ph) off++;
+            }
+            int last_ok = (L.pages[L.npages] == L.n);
+            ok = okp && p0 && p1 && empty == 0 && off == 0 && last_ok;
+            printf("[lay2 ] %s 首页高 %d、后续页高 %d，页数=%d，空页=%d 越页=%d%s\n",
+                   ok ? "OK" : "FAIL", h0, h1, L.npages, empty, off,
+                   last_ok ? "" : " 末页终点错");
             ok ? pass++ : fail++;
             layout_free(&L);
             doc_free(&d);
