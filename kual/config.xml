@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension>
+  <information>
+    <name>知乎阅读</name>
+    <version>1.2.7</version>
+    <author>zhihu-kindle-native</author>
+    <id>zhihureader</id>
+  </information>
+  <menus>
+    <menu type="json">menu.json</menu>
+  </menus>
+</extension>

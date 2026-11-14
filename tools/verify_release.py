@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""发布包自检：结构、权限、配置合法性、二进制属性、文档引用。"""
+import json
+import os
+import struct
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VER = "1.2.9"
+ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
+
+ok = True
+problems = []
+
+
+def names_base(z, base):
+    return z.namelist()
+
+
+def check(cond, msg):
+    global ok
+    print(("[ok]  " if cond else "[!!]  ") + msg)
+    if not cond:
+        ok = False
+        problems.append(msg)
+
+
+def main():
+    check(os.path.exists(ZIP), "发布包存在：%s" % ZIP)
+    if not os.path.exists(ZIP):
+        return
+
+    z = zipfile.ZipFile(ZIP)
+    names = z.namelist()
+    base = "知乎阅读-Kindle-%s/" % VER
+
+    need = [
+        "extensions/zhihureader/config.xml",
+        "extensions/zhihureader/menu.json",
+        "extensions/zhihureader/app/zhihu",
+        "extensions/zhihureader/bin/start.sh",
+        "extensions/zhihureader/bin/install.sh",
+        "extensions/zhihureader/bin/log.sh",
+        "README.md",
+        "安装说明.txt",
+        "LICENSE-AGPL-3.0.txt",
+    ]
+    for n in need:
+        check(base + n in names, "包含 %s" % n)
+
+    # 可执行权限
+    for n in ("extensions/zhihureader/app/zhihu", "extensions/zhihureader/bin/start.sh"):
+        info = z.getinfo(base + n)
+        mode = info.external_attr >> 16
+        check(bool(mode & 0o111), "%s 可执行（mode %o）" % (n, mode & 0o777))
+
+    # 二进制属性
+    data = z.read(base + "extensions/zhihureader/app/zhihu")
+    check(data[:4] == b"\x7fELF", "app/zhihu 是 ELF")
+    ei_class = data[4]
+    e_machine = struct.unpack_from("<H", data, 18)[0]
+    check(ei_class == 1, "32 位 ELF")
+    check(e_machine == 40, "ARM 架构（e_machine=40）")
+    # 静态链接：无 PT_INTERP 段
+    e_phoff = struct.unpack_from("<I", data, 28)[0]
+    e_phnum = struct.unpack_from("<H", data, 44)[0]
+    has_interp = False
+    for i in range(e_phnum):
+        p_type = struct.unpack_from("<I", data, e_phoff + i * 32)[0]
+        if p_type == 3:
+            has_interp = True
+    check(not has_interp, "静态链接（无 PT_INTERP）")
+    check(len(data) > 1_000_000, "二进制大小 %d 字节" % len(data))
+
+    # 这一次修复的几个要点，必须在包里，防止"改了源码但打包用了旧产物"
+    check(VER.encode() in data, "二进制内含版本号 %s" % VER)
+    sh = z.read(base + "extensions/zhihureader/bin/start.sh").decode("utf-8", "replace")
+    check("cvm_pid()" in sh, "start.sh 含 cvm_pid 清理")
+    check("kill -9" in sh, "start.sh 含 kill -9")
+    check("/sys/power/wake_lock" in sh, "start.sh 含内核 wakelock")
+    check("--grabtest" in sh, "start.sh 用 --grabtest 决定要不要接管系统界面")
+    check("framework=auto" in sh or "framework auto" in sh, "start.sh 默认 framework=auto")
+    check("grab=busy" in sh, "start.sh 认得 grab=busy（触摸被独占）")
+    check(".framework_stopped" in sh, "start.sh 用标记文件避免重复 start framework")
+    check("suspend_stats" in sh, "start.sh 记录挂起统计")
+    check("kmsg.log" in sh, "start.sh 把 dmesg 尾巴落盘")
+    check("preventScreenSaver" in sh, "start.sh 含防休眠心跳")
+    fbc = z.read(base + "source/src/fb.c").decode("utf-8", "replace")
+    check("MXCFB_SEND_UPDATE _IOWR" in fbc, "fb.c 的 SEND_UPDATE 用 _IOWR")
+    check("eips_shot" in fbc, "fb.c 有 eips 刷新后路")
+    check("png_write_gray8" in fbc, "fb.c 用 PNG 把整页交给 eips")
+    check("unknown_errno" in fbc, "fb.c 先量\"未知命令\"基线再解释 EINVAL")
+    check(base + "source/src/png.c" in names, "包含 source/src/png.c")
+    check("ioc_dir(ZH_IOC_RW" in fbc, "fb.c 探测用 _IOWR 方向位")
+    check("fb_trace" in fbc, "fb.c 含首帧 trace")
+    check("fb_guard" in fbc, "fb.c 含屏幕归属守护")
+    check("fb_sample_sig" in fbc, "fb.c 含 framebuffer 采样哈希")
+    check("SEND_UPDATE 耗时" in fbc, "fb.c 记录刷新 ioctl 耗时")
+    inc = z.read(base + "source/src/input.c").decode("utf-8", "replace")
+    check("EVIOCGRAB" in inc, "input.c 抢触摸屏独占（EVIOCGRAB）")
+    check("grab=ok" in inc, "input.c 记录 grab 结果")
+    mnc = z.read(base + "source/src/main.c").decode("utf-8", "replace")
+    check("atexit(restore_atexit)" in mnc, "main.c 退出时自己还原系统界面")
+    check("setsid()" in mnc, "main.c 自成会话（躲开进程组 kill）")
+    check("--grabtest" in mnc, "main.c 提供 --grabtest")
+    uic = z.read(base + "source/src/ui.c").decode("utf-8", "replace")
+    check("present_ui" in uic, "ui.c 菜单用快刷（present_ui）")
+    check("主循环卡顿" in uic, "ui.c 主循环看门狗埋点")
+    check("redraw_current" in uic, "ui.c 能重画当前屏（被抢屏后自愈）")
+
+    # 1.2.5：触摸随旋转、影子回灌、详情回退、接口自检
+    check("sync_touch" in uic or "input_set_rotate(g_cfg.rotate" in uic,
+          "ui.c 改旋转时同步触摸（1.2.5 核心）")
+    check("fb_shadow_enable" in uic, "ui.c 启用影子副本（抢屏后整页回灌）")
+    check("fb_restore" in fbc, "fb.c 有整页回灌")
+    check("shadow_sync" in fbc, "fb.c 每次刷屏后同步影子副本")
+    api = z.read(base + "source/src/api.c").decode("utf-8", "replace")
+    check("api_answer_detail2" in api, "api.c 详情带上下文 Referer + 404 回退")
+    check("UA_PC" in api, "api.c 网页端接口用桌面 UA")
+    check("api_ids_selftest" in api, "api.c 有 URL->id 自检")
+    check("api_last_head" in api, "api.c 记录响应体前 200 字节（404 证据）")
+    check("--apitest" in mnc, "main.c 提供 --apitest 接口体检")
+    check("json_get_idstr" in mnc, "main.c 自检 19 位 id（[id64]）")
+    jsc = z.read(base + "source/src/json.c").decode("utf-8", "replace")
+    check("v->raw = xstrdup" in jsc, "json.c 保留数字原始字面量（19 位 id 不丢精度）")
+    check("json_get_idstr" in api, "api.c 用 idstr 取 id（不用 double/long）")
+    check("input_set_rotate" in inc, "input.c 触摸随旋转（pix_off 的逆变换）")
+    check("input_rotate_selftest" in inc, "input.c 四方向映射自检")
+    check("--apitest" in sh, "start.sh 有 apitest 菜单入口")
+    check(".want_stop" in sh, "start.sh 支持程序请求停掉系统界面")
+
+
+    # 1.2.6：翻页键独占、回答摘要标题、详情元信息、推荐多页、私信端点、
+    #         收藏接线、真图（JPEG 解码）
+    check("input_key_grab_rule" in inc, "input.c 有翻页键独占规则（含翻页键且不含电源键）")
+    check("grabkeys" in inc, "input.c 支持 grabkeys=0 关掉按键独占")
+    check("has_power" in inc, "input.c 探测按键设备是否含电源键")
+    check("html_plain" in api, "api.c 回答无标题时用摘要（html_plain）")
+    check("item_count" in api, "api.c 收藏夹条目数取 item_count")
+    check("created_time" in api, "api.c 详情解析 created_time")
+    check("api_format_date" in api, "api.c 有 Unix 时间格式化")
+    check("api_all_collections" in api, "api.c 有「全部收藏」合并")
+    check("api_fetch_bin" in api, "api.c 能取图片二进制（带 Cookie/Referer）")
+    check("api_list_save" in api, "api.c ApiList 落盘（父子进程传列表）")
+    check("job_recommend" in uic, "ui.c 推荐多页合并（job_recommend）")
+    check("REC_PAGES" in uic, "ui.c 推荐页数上限（REC_PAGES）")
+    check("act_collections" in uic, "ui.c 收藏真正接线（act_collections）")
+    check("act_allfav" in uic, "ui.c 有「全部收藏」入口")
+    check("doc_images_prepare" in uic, "ui.c 打开文章时只建占位（不再同步等图）")
+    check("doc_insert_front" in uic, "ui.c 正文顶部插元信息（BLK_META）")
+    check("draw_reader_image" in uic, "ui.c 阅读页绘制图片")
+    check("显示图片" in uic, "ui.c 设置项改名为「显示图片」")
+    check(base + "source/src/img.c" in names, "包含 source/src/img.c（JPEG 解码）")
+    check(base + "source/src/img.h" in names, "包含 source/src/img.h")
+    imgc = z.read(base + "source/src/img.c").decode("utf-8", "replace")
+    check("idct_block" in imgc, "img.c 有定点 IDCT（armv5te 无浮点）")
+    check("box_down" in imgc, "img.c 解码后盒式缩小")
+    check("渐进式 JPEG 暂不支持" in imgc, "img.c 明确拒绝渐进式 JPEG")
+    check("img_cache_save" in imgc, "img.c 图片落盘缓存")
+    ctc = z.read(base + "source/src/content.c").decode("utf-8", "replace")
+    check("data-actualsrc" in ctc, "content.c 取知乎真图地址（data-actualsrc）")
+    check("BLK_IMAGE" in ctc, "content.c 插入图片块")
+    lc = z.read(base + "source/src/layout.c").decode("utf-8", "replace")
+    check("block_image_h" in lc, "layout.c 图片按高度占位")
+    soc = z.read(base + "source/src/social.c").decode("utf-8", "replace")
+    check("/api/v4/inbox" in soc, "social.c 私信端点改为 /api/v4/inbox")
+    check("participant" in soc, "social.c 解析 participant 昵称")
+    check("social_parse_threads" in soc, "social.c 会话解析可离线自检")
+    check("social_parse_threads" in mnc, "main.c 自检会话解析（[dm2]）")
+    check("img_selftest" in mnc, "main.c 自检 JPEG 解码（[img]）")
+    check("input_key_grab_rule" in mnc, "main.c 自检翻页键规则（[grab]）")
+
+    # 1.2.7：右下角统一返回、阅读页大标题、图片异步、列表翻页/刷新、
+    #         私信与收藏端点修正、KUAL 二级菜单
+    check("footer_btn" in uic, "ui.c 有统一页脚按钮（footer_btn）")
+    check("BTN_BACK" in uic, "ui.c 每个次级页面都加「返回」按钮")
+    check("footer_hit" in uic, "ui.c 按钮可点击（footer_hit）")
+    check("reader_header_h" in uic, "ui.c 阅读页页眉加高以容纳大标题")
+    check("draw_reader_header" in uic, "ui.c 阅读页标题单独绘制（更大更粗）")
+    check("reader_relayout_keep" in uic, "ui.c 图片到货后重排仍锚定阅读位置")
+    check("doc_images_prepare" in uic, "ui.c 未下到的图先排成占位块")
+    check("draw_img_placeholder" in uic, "ui.c 占位框画出「图片加载中」与进度")
+    check("img_start" in uic, "ui.c 图片后台进程（img_start）")
+    check("img_tick" in uic, "ui.c 主循环轮询图片进度（img_tick）")
+    check("doc_images_give_up" in uic, "ui.c 全部失败后回退文字占位")
+    check("list_page" in uic, "ui.c 列表整页翻页（list_page）")
+    check("BTN_REFRESH" in uic, "ui.c 推荐列表有刷新按钮")
+    check("sim_seed_image(g.doc_refs.v[0])" in uic, "ui.c 模拟器可延迟图片验证异步链路")
+    check("members/self/favlists" in api, "api.c 收藏夹改用 members/self/favlists")
+    check("api_last_next" in api, "api.c 保留 paging.next")
+    check("api_recommend_next" in api, "api.c 按 next 续页拉推荐")
+    check("fetch_bin_once" in api, "api.c 图片下载分级重试")
+    check("_1440w.jpg" in api, "api.c 图片失败时改后缀转码重试")
+    check("messages_at" in soc, "social.c 优先用会话自带 url 取消息")
+    check("pick_url" in soc, "social.c 保存会话自带消息地址")
+    check("--dmprobe" in mnc, "main.c 提供 --dmprobe（私信端点诊断）")
+    check("[imgp ]" in mnc, "main.c 自检占位块排版（[imgp]）")
+    check("[dm3  ]" in mnc, "main.c 自检会话 url 保留（[dm3]）")
+    check("[fav2 ]" in mnc, "main.c 自检收藏夹列表解析（[fav2]）")
+    check("[next ]" in mnc, "main.c 自检 paging.next（[next]）")
+    check("dmprobe" in sh, "start.sh 有「私信端点诊断」入口")
+
+    # 1.2.8：残影/发虚（刷新方式）与图片三档、缓存键
+    check('"-f", "-g"' in fbc, "fb.c eips 换屏走 -f -g 全刷（不再只发局部更新）")
+    check("use_du" in fbc, "fb.c DU 波形改为显式开关（默认不用）")
+    check("want_full" in fbc, "fb.c 局部刷新每 3 次补一次全刷")
+    check("present_screen" in uic, "ui.c 换屏统一走全刷（present_screen）")
+    check("fast_next" in uic, "ui.c 只有翻页允许局部刷新（fast_next）")
+    check("eipsclean" in fbc, "fb.c 支持 eipsclean=0（退回全局部刷新）")
+    check("点按加载此图" in uic, "ui.c 点按档占位写「点按加载此图」")
+    check("reader_img_hit" in uic, "ui.c 阅读页图片占位可命中（点按加载）")
+    check("img_load_one" in uic, "ui.c 单张图片下载任务（img_load_one）")
+    check("\\x02" in uic, "ui.c 点按档用 \\x02 前缀与自动档区分")
+    check("img_cache_fill(refs->v[i], IMG_CACHE_W" in uic, "ui.c 存盘后按缓存键回读校验")
+    check("cache_path(path, sizeof(path), url, IMG_CACHE_W)" in imgc,
+          "img.c 缓存文件名固定用 IMG_CACHE_W（1.2.7 的图片全灭根因）")
+    check("[imod ]" in mnc, "main.c 自检三档图片模式（[imod]）")
+
+    # 1.2.9：状态栏开关、推荐条数、PNG/WebP、文章分目录缓存、Regal、
+    #         旋转跟随、私信端点修正、KUAL 精简、标题只在第一页
+    check("showbar" in uic, "ui.c 设置里有「系统状态栏」开关（showbar）")
+    check("showbar" in sh, "start.sh 读 showbar=0 接管系统界面")
+    check("g_cfg.rec" in uic and "rec=%d" in uic, "ui.c 推荐条数 6/12/18 可配置并写回 config")
+    check("limit=%d" in api.replace("%", "%") or "limit=%d" in api, "api.c 推荐接口支持自定义 limit")
+    check("stbi_load_from_memory" in imgc, "img.c 支持 PNG/GIF/BMP（stb_image）")
+    check("WebPDecodeYUV" in imgc, "img.c 支持 WebP（libwebp）")
+    check("IMG_MAX_PIXELS" in imgc, "img.c 超大图设上限（防卡死）")
+    check("img_cache_set_article" in imgc and "img_cache_set_article" in uic,
+          "img.c/ui.c 图片缓存按文章分目录")
+    check("img_cache_count" in imgc, "img.c 能统计图片缓存文件数")
+    check("cache_rm_rec" in api, "api.c「清空缓存」递归删除子目录")
+    check("WAVEFORM_MODE_REAGL" in fbc, "fb.c 有 Regal（REAGL=0x8）波形")
+    check('"-w", "8"' in fbc, "fb.c eips 路径尝试 -w 8（Regal）")
+    check("fb_poll_rotate" in fbc and "fb_poll_rotate" in uic, "fb.c/ui.c 硬件旋转跟随（触摸同步）")
+    check("autorot" in fbc, "fb.c 支持 autorot=0 关闭旋转跟随")
+    check('/api/v4/messages?thread_id={id}' in soc, "social.c 私信消息首选实测存在的端点")
+    check("social_msg_candidate" in soc, "social.c 端点候选可被自检钉死")
+    check("[dme  ]" in mnc, "main.c 自检私信端点候选（[dme]）")
+    check("[lay2 ]" in mnc, "main.c 自检首页/后续页两种页高（[lay2]）")
+    check("layout_build2" in uic, "ui.c 阅读页首页与后续页分开排（layout_build2）")
+    check("layout_page_top" in uic, "ui.c 用 layout_page_top 换算页内位置")
+    check(any("img_test_webp.h" in n for n in names_base(z, base)), "源码含 WebP 测试图头文件")
+
+    # 配置合法
+    menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))
+
+    def walk(items, depth=1):
+        acts = 0
+        for it in items:
+            if "items" in it:
+                check(depth == 1, "二级菜单「%s」只出现在第一层" % it.get("name"))
+                acts += walk(it["items"], depth + 1)
+            else:
+                act = it.get("action", "")
+                okk = bool(act) and (base + "extensions/zhihureader/" + act in names)
+                check(okk, "菜单「%s」指向的脚本存在" % it.get("name"))
+                acts += 1
+        return acts
+
+    check("items" in menu and len(menu["items"]) == 2, "menu.json 是一级菜单：%d 个分类" % len(menu.get("items", [])))
+    total = walk(menu["items"])
+    check(total >= 8, "二级菜单共 %d 项（安装/启动/自检/日志/诊断/排障）" % total)
+
+    ET.fromstring(z.read(base + "extensions/zhihureader/config.xml"))
+    check(True, "config.xml 是合法 XML")
+
+    # 脚本 shebang
+    for n in ("start.sh", "install.sh", "log.sh"):
+        body = z.read(base + "extensions/zhihureader/bin/" + n)
+        check(body.startswith(b"#!/bin/sh"), "%s 有 shebang" % n)
+
+    # README 里的图片引用
+    readme = z.read(base + "README.md").decode("utf-8")
+    import re
+    for m in re.finditer(r"\]\((docs/[^)]+)\)", readme):
+        check(base + m.group(1) in names, "README 图片存在：%s" % m.group(1))
+
+    print()
+    if ok:
+        print("全部检查通过（%d 个文件）" % len(names))
+    else:
+        print("发现问题：")
+        for p in problems:
+            print("  - " + p)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

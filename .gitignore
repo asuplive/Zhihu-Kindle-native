@@ -1,0 +1,10 @@
+# 构建产物与运行时状态
+dist/
+release/
+.sim/
+.sim-sa/
+.sim*/home/
+__pycache__/
+*.o
+*.ppm
+*.ppm.seq

@@ -1,0 +1,22 @@
+{
+  "name": "知乎阅读",
+  "items": [
+    {
+      "name": "知乎阅读",
+      "action": "bin/start.sh",
+      "params": "run"
+    },
+    {
+      "name": "诊断和排障",
+      "items": [
+        { "name": "安装 / 更新程序", "action": "bin/install.sh", "params": "install" },
+        { "name": "查看运行日志", "action": "bin/log.sh", "params": "log" },
+        { "name": "运行自检（不联网）", "action": "bin/start.sh", "params": "selftest" },
+        { "name": "硬件诊断（屏幕/字体/触摸）", "action": "bin/start.sh", "params": "diag" },
+        { "name": "接口诊断（热榜/推荐/正文）", "action": "bin/start.sh", "params": "apitest" },
+        { "name": "私信端点诊断", "action": "bin/start.sh", "params": "dmprobe" },
+        { "name": "排障：抓 eips 刷新参数", "action": "bin/start.sh", "params": "spy" }
+      ]
+    }
+  ]
+}
