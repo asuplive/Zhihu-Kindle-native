@@ -274,6 +274,19 @@ typedef struct {
      * 必须写清「为什么空」和「下一步做什么」。 */
     char list_msg[512];
 
+    /* 1.2.13：返回键层级化。进入子列表（问题→回答列表、收藏夹→收藏内容）
+     * 前把当前列表整个搬进来存着；子列表按返回时搬回去。
+     * 这样右下角「返回」就是"返回上一项"：
+     *   回答阅读页 → 回答列表 → 热榜/收藏列表 → 主页。 */
+    ApiList parent_list;
+    char   parent_kind[16];
+    char   parent_title[200];
+    char   parent_msg[512];
+    int    parent_sel;
+    int    parent_top;
+    int    parent_page;
+    int    parent_valid;
+
     /* 阅读 */
     Doc    doc;
     Layout lay;
@@ -637,6 +650,10 @@ static int list_is_feed(void) {
 }
 
 static int list_row_h(void) {
+    /* 回答列表（点热榜问题后看到的）：1.2.13 起每条只显示回答摘要
+     * （顶部已有问题标题，条目里不再重复），始终用高行放 3 行摘要 */
+    if (strcmp(g.list_kind, "answers") == 0)
+        return g.base * 6;
     if (g_cfg.liststyle == 1 && list_is_feed())
         return g.base * 6;
     return g.base * 13 / 5;
@@ -683,7 +700,20 @@ static void draw_list(void) {
         int numw = font_width(tpx * 3 / 4, num, (int)strlen(num));
         int tx = g.margin + numw + g.base / 2;
         int fg3 = sel ? 170 : 130;         /* 作者·赞同：比摘要再浅一档 */
-        if (g_cfg.liststyle == 1 && list_is_feed()) {
+        if (strcmp(g.list_kind, "answers") == 0) {
+            /* 1.2.13：回答列表不再显示问题标题——页眉上已经是这个问题了，
+             * 每条再显示一遍纯属重复（真机反馈）。每条 = 回答摘要
+             * （最多 3 行，是这一条的主体内容）+ 作者·赞同。 */
+            int spx = tpx * 4 / 5;
+            const char *sum = it->summary[0] ? it->summary : it->title;
+            int ty = y + g.base / 2 + spx;              /* 摘要第一行 baseline */
+            if (sum && *sum)
+                draw_wrapped_n(tx, ty, g.W - g.margin - tx, spx, sum,
+                               sel ? 0 : 30, 3, y + rh - g.base / 2);
+            if (it->sub[0])
+                text_at(tx, y + rh - g.base / 2 - tpx * 3 / 5, tpx * 3 / 5,
+                        it->sub, fg3, 0);
+        } else if (g_cfg.liststyle == 1 && list_is_feed()) {
             /* 详细版：问题标题（加粗）→ 回答摘要（固定 2 行）→ 作者赞同 */
             int spx = tpx * 4 / 5;
             int ty = y + g.base / 2 + tpx;              /* 标题 baseline */
@@ -1184,6 +1214,8 @@ static void draw_about(void) {
         "",
         "数据来源：知乎网页端接口（设备端签名）",
         "本项目以 AGPL-3.0 发布",
+        "GitHub：github.com/asuplive/Zhihu-Kindle-native",
+        "（源码与最新版本下载）",
         "",
         "点任意位置返回",
     };
@@ -1859,6 +1891,96 @@ static int fetch_job(const char *path, const char *title, char *out_path, size_t
 
 /* ---------------- 列表填充 ---------------- */
 
+/* 1.2.13：返回键层级化。进入子列表前把当前列表整个搬进 parent_*，
+ * 子列表按返回时搬回去。搬 = 指针移交（不复制数据），O(1)。
+ * 注意顺序：先 push 再 list_reset（reset 会释放 g.list）。 */
+static void list_push_parent(void) {
+    if (g.scr != SCR_LIST || g.list.v == NULL) { g.parent_valid = 0; return; }
+    api_list_free(&g.parent_list);
+    g.parent_list = g.list;
+    memset(&g.list, 0, sizeof(g.list));   /* 所有权已移交，别让 reset 再释放一次 */
+    snprintf(g.parent_kind,  sizeof(g.parent_kind),  "%s", g.list_kind);
+    snprintf(g.parent_title, sizeof(g.parent_title), "%s", g.list_title);
+    snprintf(g.parent_msg,   sizeof(g.parent_msg),   "%s", g.list_msg);
+    g.parent_sel  = g.list_sel;
+    g.parent_top  = g.list_top;
+    g.parent_page = g.list_page;
+    g.parent_valid = 1;
+}
+
+static int list_pop_parent(void) {
+    if (!g.parent_valid || g.parent_list.v == NULL) { g.parent_valid = 0; return -1; }
+    api_list_free(&g.list);
+    g.list = g.parent_list;
+    memset(&g.parent_list, 0, sizeof(g.parent_list));
+    snprintf(g.list_kind,  sizeof(g.list_kind),  "%s", g.parent_kind);
+    snprintf(g.list_title, sizeof(g.list_title), "%s", g.parent_title);
+    snprintf(g.list_msg,   sizeof(g.list_msg),   "%s", g.parent_msg);
+    g.list_sel  = g.parent_sel;
+    g.list_top  = g.parent_top;
+    g.list_page = g.parent_page;
+    g.parent_valid = 0;
+    g.scr = SCR_LIST;
+    return 0;
+}
+
+/* 顶层列表（热榜/推荐/搜索/收藏夹）：没有"上一项"，清掉可能残留的快照 */
+static void list_clear_parent(void) {
+    if (g.parent_valid) {
+        api_list_free(&g.parent_list);
+        memset(&g.parent_list, 0, sizeof(g.parent_list));
+        g.parent_valid = 0;
+    }
+}
+/* 1.2.13 自检：层级返回的快照搬移（push/pop/clear）。
+ * 用两个临时 ApiList 模拟"热榜 → 问题列表"的进出，验证：
+ *  push 后原列表所有权移交、g.list 被清空（reset 不会双重释放）；
+ *  pop 后条目原样回来、选中/滚动位置保留；
+ *  clear 释放干净、二次 pop 报"没有上一层"。 */
+int ui_nav_stack_test(void) {
+    int ok = 1;
+    api_list_free(&g.list);
+    memset(&g.list, 0, sizeof(g.list));
+    /* 用真实解析路径造两条热榜数据（避免依赖列表内部追加函数） */
+    const char *j =
+        "{\"data\":[{\"type\":\"answer\",\"id\":\"1\","
+        "\"question\":{\"title\":\"热榜条目甲\"},\"voteup_count\":42},"
+        "{\"type\":\"answer\",\"id\":\"2\","
+        "\"question\":{\"title\":\"热榜条目乙\"},\"voteup_count\":7}]}";
+    if (api_parse_feed(j, strlen(j), &g.list) != 0 || g.list.n != 2) return 0;
+    g.list_sel = 1;
+    g.list_top = 1;
+    g.scr = SCR_LIST;
+    strcpy(g.list_kind, "hot");
+    strcpy(g.list_title, "热榜");
+
+    list_push_parent();
+    ok = ok && g.parent_valid == 1 && g.parent_list.n == 2 &&
+         g.list.v == NULL && g.list.n == 0 &&
+         g.parent_sel == 1 && strcmp(g.parent_kind, "hot") == 0;
+
+    /* 模拟 list_reset 后装了子列表 */
+    api_list_free(&g.list);
+    memset(&g.list, 0, sizeof(g.list));
+    const char *j2 =
+        "{\"data\":[{\"type\":\"answer\",\"id\":\"9\","
+        "\"question\":{\"title\":\"回答摘要一条\"}}]}";
+    api_parse_feed(j2, strlen(j2), &g.list);
+    strcpy(g.list_kind, "answers");
+
+    ok = ok && list_pop_parent() == 0 &&
+         g.list.n == 2 && g.list.v[1].voteup == 7 &&
+         strcmp(g.list.v[0].title, "热榜条目甲") == 0 &&
+         g.list_sel == 1 && g.scr == SCR_LIST;
+    ok = ok && list_pop_parent() == -1 && g.parent_valid == 0;
+
+    api_list_free(&g.list);
+    memset(&g.list, 0, sizeof(g.list));
+    list_clear_parent();
+    return ok;
+}
+
+
 static void list_reset(const char *title, const char *kind) {
     api_list_free(&g.list);
     snprintf(g.list_title, sizeof(g.list_title), "%s", title ? title : "");
@@ -2170,6 +2292,12 @@ static void img_load_one(int idx) {
                      "「接口诊断」里看同一个地址的状态码。", err[0] ? err : "未知");
         return;
     }
+    /* 1.2.13 关键修复：run_job -> show_loading 把 g.scr 换成了 SCR_LOADING，
+     * 成功路径如果不换回来，画面画出来了、状态机还停在"加载页"——
+     * 所有点击和按键都被 SCR_LOADING 分支忽略，看起来就是
+     * "图片显示完整个画面冻住，只能重启"（1.2.12 真机实测）。
+     * 失败路径本来就会经 show_message 回到阅读页，只有成功路径漏了。 */
+    g.scr = SCR_READER;
     if (doc_images_apply() > 0) {
         reader_relayout_keep();
     }
@@ -2444,6 +2572,7 @@ static void act_hot(void) {
     size_t n = 0;
     char *body = read_file(json, &n);
     if (!body) { show_message("读取响应失败"); return; }
+    list_clear_parent();
     list_reset("热榜", "hot");
     int rc = api_parse_feed(body, n, &g.list);
     free(body);
@@ -2498,6 +2627,7 @@ static void act_recommend(void) {
         show_message("%s\n\n（推荐流对登录态和网络出口较敏感，若持续失败可重新登录或换网络）", err);
         return;
     }
+    list_clear_parent();
     list_reset("推荐", "rec");
     if (api_list_load(path, &g.list) != 0) { show_message("推荐数据读取失败"); return; }
     if (g.list.n == 0) list_set_empty_msg("推荐接口返回空列表，隔一会儿再刷新。");
@@ -2531,6 +2661,7 @@ static void act_search(const char *q) {
     size_t n = 0;
     char *body = read_file(json, &n);
     if (!body) { show_message("读取响应失败"); return; }
+    list_clear_parent();
     list_reset(q, "search");
     int rc = api_parse_feed(body, n, &g.list);
     free(body);
@@ -2552,6 +2683,7 @@ static void act_question(const char *qid, const char *title) {
     size_t n = 0;
     char *body = read_file(json, &n);
     if (!body) { show_message("读取响应失败"); return; }
+    list_push_parent();               /* 1.2.13：记住热榜/搜索/收藏，返回键要回这里 */
     list_reset(title, "answers");
     snprintf(g.list_qid, sizeof(g.list_qid), "%s", qid);
     int rc = api_parse_feed(body, n, &g.list);
@@ -2670,6 +2802,7 @@ static void act_collection_items(const char *cid, const char *title) {
     size_t n = 0;
     char *body = read_file(json, &n);
     if (!body) { show_message("读取响应失败"); return; }
+    list_push_parent();               /* 1.2.13：记住收藏夹列表，返回键要回这里 */
     list_reset(title && *title ? title : "收藏内容", "collection");
     int rc = api_parse_feed(body, n, &g.list);
     free(body);
@@ -2686,6 +2819,7 @@ static void act_allfav(void) {
         show_message("%s", err);
         return;
     }
+    list_clear_parent();
     list_reset("全部收藏", "collection");
     if (api_list_load(path, &g.list) != 0) { show_message("收藏数据读取失败"); return; }
     if (g.list.n == 0) list_set_empty_msg("收藏夹里还没有内容。");
@@ -2987,6 +3121,9 @@ static void nav_back(void) {
             break;
         case SCR_LIST:
         default:
+            /* 1.2.13：有上一层（问题列表/收藏内容）就回上一层，
+             * 真正的顶层列表才回主页。 */
+            if (list_pop_parent() == 0) { draw_list(); break; }
             g.scr = SCR_HOME;
             g.list_sel = 0;
             draw_home();
@@ -3520,7 +3657,7 @@ static void handle_key(int code) {
             }
             break;
         case SCR_LIST:
-            if (code == 158 || code == 102) { g.scr = SCR_HOME; draw_home(); }
+            if (code == 158 || code == 102) nav_back();   /* 1.2.13：返回上一项 */
             else if (code == 103 || code == 105 || code == 104) { if (g.list_sel > 0) { g.list_sel--; draw_list(); } }
             else if (code == 108 || code == 106 || code == 109) { if (g.list_sel + 1 < g.list.n) { g.list_sel++; draw_list(); } }
             else if (code == 28 || code == 96) {
@@ -3767,7 +3904,7 @@ int app_run(void) {
              * 默认与 framework 共存，cvm 可能把屏抢回去。每秒抽查一次
              * 我们画的那页有没有被人改过；改了就把当前这屏重画一遍。
              * 连续被抢会退避，避免"每秒钟闪一次"比"被盖掉"还难受。 */
-            if (now - g.guard_ms > 120) {
+            if (now - g.guard_ms > 100) {
                 g.guard_ms = now;
                 if (now >= guard_hold) {
                     uint32_t sig = g.screen_sig;
@@ -3796,11 +3933,14 @@ int app_run(void) {
                          * framework 看门狗宽限期后整机重启（真机两次）。
                          * 抢屏由上面的影子回灌/整页重画自己解决。 */
 
-                        if (guard_streak >= 3) {
-                            guard_hold = now_ms_ui() + 3000;
-                            guard_streak = 0;
-                            logmsg("屏幕守护: 连续被抢，退避 3 秒");
-                        }
+                        /* 1.2.13：原来的"连续 3 次退避 3 秒"会让 cvm 在退避
+                         * 窗口里画出的顶栏时间/电量整整停留 3 秒（真机反馈
+                         * "时间冒出来，过一会儿才消失"）。改成恢复节流：
+                         * 检测仍然每 100ms 一次，回灌最多 500ms 一次——
+                         * 冒出来的顶栏最多可见半秒就被压掉，也不会
+                         * 陷入无节制的连续全刷。 */
+                        guard_hold = now_ms_ui() + 500;
+                        if (guard_streak >= 6) guard_streak = 0;
                     } else {
                         guard_streak = 0;
                     }
@@ -3890,7 +4030,8 @@ int app_run(void) {
         if (ev.type == ZH_TAP) handle_tap(ev.x, ev.y);
         else if (ev.type == ZH_SWIPE_L) {
             if (g.scr == SCR_READER || g.scr == SCR_DMREAD) reader_goto(g.page + 1);
-            else if (g.scr == SCR_LIST || g.scr == SCR_DMLIST) { g.scr = SCR_HOME; draw_home(); }
+            else if (g.scr == SCR_LIST) nav_back();          /* 1.2.13：返回上一项 */
+            else if (g.scr == SCR_DMLIST) { g.scr = SCR_HOME; draw_home(); }
         } else if (ev.type == ZH_SWIPE_R) {
             if (g.scr == SCR_READER || g.scr == SCR_DMREAD) reader_goto(g.page - 1);
         } else if (ev.type == ZH_KEY) handle_key(ev.code);

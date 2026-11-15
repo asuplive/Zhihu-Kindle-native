@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.12"
+VER = "1.2.13"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -289,6 +289,35 @@ def main():
           "ui.c 阅读页标题折行上限放开到 8 行（完整显示）")
     check("标题=问题标题、摘要进 summary" in mnc,
           "main.c 自检 [ans] 钉死 1.2.12 条目语义")
+
+    # 1.2.13：真机六修——层级返回、图片后冻结、压屏节流、私信 App 端通道、
+    #          关于页 GitHub、回答列表去重标题
+    check("list_push_parent" in uic and "list_pop_parent" in uic and
+          "list_clear_parent" in uic,
+          "ui.c 列表快照 push/pop/clear（返回键层级化）")
+    check("list_push_parent();               /* 1.2.13" in uic,
+          "ui.c 进入问题列表/收藏内容前先存上一层")
+    check("if (code == 158 || code == 102) nav_back();" in uic,
+          "ui.c 物理返回键在列表页也走层级返回")
+    check("g.scr = SCR_READER;" in uic and
+          "成功路径如果不换回来" in uic,
+          "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")
+    check("guard_hold = now_ms_ui() + 500;" in uic and
+          "guard_hold = now_ms_ui() + 3000" not in uic,
+          "ui.c 压屏改 500ms 节流（顶栏时间不再停留 3 秒）")
+    apic2 = z.read(base + "source/src/api.c").decode("utf-8", "replace")
+    check('strncmp(path, "https://", 8) == 0' in apic2,
+          "api.c 支持绝对 URL（api.zhihu.com App 端通道）")
+    soc = z.read(base + "source/src/social.c").decode("utf-8", "replace")
+    check("https://api.zhihu.com/messages/inbox?thread_id=" in soc,
+          "social.c 新增 App 端私信端点（游客探针 401=路由存在）")
+    check("200 但解析失败" in soc and "%d* " in soc,
+          "social.c 200-解析失败也计入诊断状态（不再误报全 404）")
+    check("github.com/asuplive/Zhihu-Kindle-native" in uic,
+          "ui.c 关于页含 GitHub 仓库地址")
+    check('strcmp(g.list_kind, "answers") == 0) {' in uic and
+          "页眉上已经是这个问题了" in uic,
+          "ui.c 回答列表去掉重复问题标题（摘要为主，推荐列表不变）")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

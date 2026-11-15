@@ -230,7 +230,14 @@ static void err_from_body(const char *json, size_t len, const char *fallback) {
 static int api_call_ref(const char *method, const char *path, const char *body,
                         const char *referer, Buf *out) {
     char url[1400];
-    snprintf(url, sizeof(url), "https://www.zhihu.com%s", path);
+    /* 1.2.13：允许绝对 URL（https:// 开头原样使用）。知乎的私信接口同时
+     * 存在于 web 端（www.zhihu.com/api/v4/...）和 App 端（api.zhihu.com/...），
+     * 后者对游客探针返回 401（路由存在、要登录）——登录态真机上很可能
+     * 就是它才有数据。social.c 的候选端点里会出现完整地址。 */
+    if (strncmp(path, "https://", 8) == 0 || strncmp(path, "http://", 7) == 0)
+        snprintf(url, sizeof(url), "%s", path);
+    else
+        snprintf(url, sizeof(url), "https://www.zhihu.com%s", path);
     snprintf(g_last_url, sizeof(g_last_url), "%s", url);
     g_last_head[0] = 0;
 

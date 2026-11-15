@@ -810,6 +810,15 @@ static int run_selftest(void) {
         ok ? pass++ : fail++;
     }
 
+    /* [nav]（1.2.13）：返回键层级化的快照搬移 */
+    {
+        extern int ui_nav_stack_test(void);
+        ok = ui_nav_stack_test();
+        printf("[nav  ] %s 列表快照 push/pop：热榜→问题→返回→热榜（条目/选中位置保留）\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
     /* 1.2.9：排版首页高度——标题只占第一页，后续页整页都是正文。 */
     {
         char ferr[256] = "";

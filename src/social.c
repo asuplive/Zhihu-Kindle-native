@@ -19,6 +19,10 @@
 #include <string.h>
 
 static const char *THREAD_CANDIDATES[] = {
+    /* 1.2.13：App 端（api.zhihu.com）路由。2026-11 游客探针实测：
+     * /messages/inbox 返回 401（路由存在、要登录），登录态真机上
+     * 很可能这才是真正有数据的通道。绝对 URL 由 api_call 原样使用。 */
+    "https://api.zhihu.com/messages/inbox?limit=20&offset=%d",
     /* 首页私信入口用的就是它：未登录 401、登录后 200 */
     "/api/v4/inbox?limit=20&offset=%d",
     /* 1.2.9 实测存在（游客 200 + 空成功体），登录后应返回会话数组 */
@@ -33,6 +37,12 @@ static const char *MSG_CANDIDATES[] = {
      * 顺序按把握排：先 messages?thread_id，再 me/message-threads/{id}/messages
      * （404 但万一某些固件又把它加回来），最后老 inbox 路由兜底。 */
     "/api/v4/messages?thread_id={id}&limit=20&offset=%d",
+    /* 1.2.13：App 端路由，游客探针 401（路由存在、要登录）——
+     * 真机诊断显示 web 端 M1 拿到 200 空成功体（len=22，被当成游客），
+     * 所以登录态下换 App 端通道是首要尝试。 */
+    "https://api.zhihu.com/messages/inbox?thread_id={id}&limit=20&offset=%d",
+    "https://api.zhihu.com/messages?thread_id={id}&limit=20&offset=%d",
+    "https://api.zhihu.com/messages/conversation?thread_id={id}&limit=20&offset=%d",
     "/api/v4/me/message-threads/{id}/messages?limit=20&offset=%d",
     "/api/v4/inbox/{id}/messages?limit=20&offset=%d",
 };
@@ -379,8 +389,10 @@ static int messages_at(const char *url, const char *id, MsgList *out, int offset
         if (rc == 0) {
             buf_cstr(&b);
             int pr = social_parse_messages(b.p, b.len, out);
+            if (pr == 0) { buf_free(&b); return 0; }
+            logmsg("social: messages(url) %s status=%d 200 但解析失败，"
+                   "前 160 字节：%.160s", path, st, b.p ? b.p : "");
             buf_free(&b);
-            if (pr == 0) return 0;
         } else {
             buf_free(&b);
         }
@@ -409,8 +421,20 @@ static int messages_at(const char *url, const char *id, MsgList *out, int offset
         }
         buf_cstr(&b);
         int pr = social_parse_messages(b.p, b.len, out);
+        if (pr != 0) {
+            /* 1.2.13：200 但结构猜错/空成功体，之前不留痕——用户只看到
+             * "4 个端点状态 404"，真正该看到的是"200 但没有数据"。
+             * 现在状态记为 200*，响应头 160 字节进日志，照着改就行。 */
+            logmsg("social: messages[%zu] %s status=%d 200 但解析失败，"
+                   "前 160 字节：%.160s", i, path, st, b.p ? b.p : "");
+            char one_s[48];
+            snprintf(one_s, sizeof(one_s), "%d* ", st);
+            strncat(g_tried, one_s, sizeof(g_tried) - strlen(g_tried) - 1);
+            buf_free(&b);
+            attempt++;
+            continue;
+        }
         buf_free(&b);
-        if (pr != 0) { attempt++; continue; }
         logmsg("social: messages[%zu] 成功 %s n=%d", i, path, out->n);
         if (!cfg_messages[0]) snprintf(cfg_messages, sizeof(cfg_messages), "%s", list[i]);
         return 0;
