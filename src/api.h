@@ -11,7 +11,8 @@
 typedef struct {
     char  id[64];       /* 回答 id / 文章 id / 问题 id */
     char  qid[64];      /* 所属问题 id（回答时有） */
-    char  title[600];   /* 标题或问题标题 */
+    char  title[600];   /* 1.2.12：问题标题优先（回答条目取 question.title） */
+    char  summary[512]; /* 1.2.12：回答/文章摘要（excerpt，140 字，详细模式预览用） */
     char  sub[400];     /* 作者、摘要、热度等副标题 */
     char  url[256];     /* 列表里给的原始链接（排障用：404 时打日志） */
     int   type;         /* 1=回答 2=文章 3=问题 */

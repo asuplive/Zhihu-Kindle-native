@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.11"
+VER = "1.2.12"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -263,8 +263,8 @@ def main():
     check("L->npages = pn;" in layc and "L->pages[pn] = L->n;" in layc,
           "layout.c 修复 pages[pn] 未赋值导致的尾部空白页（1.2.11 主修）")
     check("npages = pn + 1;" not in layc, "layout.c 已移除 npages 多算一页")
-    check("reader_title_layout" in uic and "READER_TITLE_MAX_LINES 3" in uic,
-          "ui.c 阅读页标题自动折行（最多 3 行，完整显示）")
+    check("reader_title_layout" in uic and "READER_TITLE_MAX_LINES 8" in uic,
+          "ui.c 阅读页标题自动折行（1.2.12 上限 8 行，完整显示）")
     check("g.base / 2 + g_title_lines * lh" in uic, "ui.c 页眉高度随标题行数自适应")
     check("draw_wrapped_n" in uic and 'strcmp(g.list_kind, "answers") == 0' in uic,
           "ui.c 回答列表每条 3 行摘要预览（行高自适应）")
@@ -272,6 +272,23 @@ def main():
           "api.c 回答摘要加长到 140 字（够三行预览）")
     check("空页=" in mnc and "越页=" in mnc,
           "main.c 自检 [lay2] 钉死空页/越页回归")
+
+    # 1.2.12：推荐列表样式开关（简洁/详细）+ 问题标题优先 + 标题 8 行
+    check("liststyle" in uic and "list_is_feed" in uic,
+          "ui.c 列表样式开关（简洁/详细，作用于推荐与回答列表）")
+    check("draw_wrapped_n(tx, sy" in uic and "2, y + rh" in uic,
+          "ui.c 详细版摘要固定 2 行截断（行高恒定不跳页）")
+    check("g_cfg.liststyle ? 0 : 1" in uic, "ui.c 设置页可切换列表样式")
+    check("liststyle=%d" in uic, "config 写出 liststyle 键")
+    check("char  summary[512]" in z.read(base + "source/src/api.h").decode("utf-8", "replace"),
+          "api.h ApiItem 摘要独立字段 summary")
+    apicc = z.read(base + "source/src/api.c").decode("utf-8", "replace")
+    check('json_get_str(q, "title", NULL)' in apicc and "copy_str(it->summary" in apicc,
+          "api.c 标题优先级：条目标题 > 问题标题 > 摘要（1.2.12 问题优先）")
+    check("READER_TITLE_MAX_LINES 8" in uic,
+          "ui.c 阅读页标题折行上限放开到 8 行（完整显示）")
+    check("标题=问题标题、摘要进 summary" in mnc,
+          "main.c 自检 [ans] 钉死 1.2.12 条目语义")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

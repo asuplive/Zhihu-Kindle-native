@@ -482,35 +482,36 @@ static int parse_one(JVal *item, ApiItem *it) {
         else if (strcmp(typestr, "answer") == 0) it->type = 1;
     }
 
-    /* 标题
-     *
-     * 顺序有讲究：回答（answer）自己**没有** title，只有 excerpt / content。
-     * 1.2.5 及以前直接退化成 question.title，于是"一个问题下的多个回答"
-     * 每行都显示同一个问题标题，看起来像整个列表复制粘贴了一遍。
-     * 现在优先用这一条回答自己的摘要，实在没有才退到问题标题。 */
-    const char *title = json_get_str(t, "title", NULL);
-    if (!title) {
-        JVal *ta = json_get(t, "title_area");
-        if (ta) title = json_get_str(ta, "text", NULL);
-    }
-    char excerpt_buf[1024];
-    excerpt_buf[0] = 0;
-    if (!title || !*title) {
+    /* 1.2.12：摘要独立成 summary 字段（excerpt，最多 140 字）。
+     * 详细模式的列表布局是"问题标题 → 回答摘要 → 作者赞同"，
+     * 摘要不再挤在标题位上。 */
+    char sumbuf[1024];
+    sumbuf[0] = 0;
+    {
         const char *ex = json_get_str(t, "excerpt", NULL);
         if (!ex) {
             JVal *ea = json_get(t, "excerpt_area");
             if (ea) ex = json_get_str(ea, "text", NULL);
         }
         if (!ex) ex = json_get_str(t, "content", NULL);   /* 回答的正文 HTML */
-        /* 1.2.11：140 字。回答列表每条要露前三行预览（每行约 30 字），
-         * 46 字连两行都不够。其余有标题的列表不走这个分支，不受影响。 */
-        if (ex && *ex) html_plain(ex, excerpt_buf, sizeof(excerpt_buf), 140);
-        if (excerpt_buf[0]) title = excerpt_buf;
+        if (ex && *ex) html_plain(ex, sumbuf, sizeof(sumbuf), 140);
+    }
+    copy_str(it->summary, sizeof(it->summary), sumbuf);
+
+    /* 标题优先级（1.2.12 调整）：条目自己的 title > 问题标题 > 摘要。
+     * 之前回答条目把 excerpt 当标题（1.2.5 为了区分同一问题下的多条回答），
+     * 用户反馈"先看到回答内容再放标题，阅读逻辑不顺"——现在以问题优先，
+     * 区分同问题的多条回答交给详细模式的摘要预览。 */
+    const char *title = json_get_str(t, "title", NULL);
+    if (!title) {
+        JVal *ta = json_get(t, "title_area");
+        if (ta) title = json_get_str(ta, "text", NULL);
     }
     if (!title || !*title) {
         JVal *q = json_get(t, "question");
         if (q) title = json_get_str(q, "title", NULL);
     }
+    if (!title || !*title && sumbuf[0]) title = sumbuf;   /* 兜底：连问题标题都没有 */
     if (!title) {
         JVal *target2 = json_get(item, "highlight");
         if (target2) title = json_get_str(target2, "title", NULL);

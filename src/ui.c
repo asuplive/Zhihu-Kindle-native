@@ -50,9 +50,12 @@ typedef struct {
     int showbar;
     /* 推荐列表条数：6/12/18（6 的倍数，最多 18） */
     int rec;
+    /* 1.2.12：推荐/回答列表样式。0=简洁（标题+作者赞同，行高小适合快划），
+     * 1=详细（问题标题 → 回答摘要 2 行 → 作者赞同，留白充足）。默认详细。 */
+    int liststyle;
 } Config;
 
-static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6 };
+static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1 };
 
 static void config_load(void) {
     char path[320];
@@ -75,6 +78,7 @@ static void config_load(void) {
             else if (strcmp(k, "margin") == 0) g_cfg.margin_pct = iv;
             else if (strcmp(k, "showbar") == 0) g_cfg.showbar = iv;
             else if (strcmp(k, "rec") == 0) g_cfg.rec = iv;
+            else if (strcmp(k, "liststyle") == 0) g_cfg.liststyle = iv;
             else if (strcmp(k, "refresh") == 0)
                 snprintf(g_cfg.refresh, sizeof(g_cfg.refresh), "%s", v);
         }
@@ -92,6 +96,7 @@ static void config_load(void) {
     /* 推荐条数只认 6/12/18 */
     if (g_cfg.rec != 6 && g_cfg.rec != 12 && g_cfg.rec != 18) g_cfg.rec = 6;
     g_cfg.showbar = g_cfg.showbar ? 1 : 0;
+    if (g_cfg.liststyle != 0 && g_cfg.liststyle != 1) g_cfg.liststyle = 1;
 }
 
 static void config_save(void) {
@@ -124,7 +129,7 @@ static void config_save(void) {
                                   strcmp(kt, "size") == 0 || strcmp(kt, "fast") == 0 ||
                                   strcmp(kt, "rotate") == 0 || strcmp(kt, "images") == 0 ||
                                   strcmp(kt, "margin") == 0 || strcmp(kt, "showbar") == 0 ||
-                                  strcmp(kt, "rec") == 0;
+                                  strcmp(kt, "rec") == 0 || strcmp(kt, "liststyle") == 0;
                     if (!managed) buf_printf(&keep, "%s\n", line);
                 }
                 if (!nl) break;
@@ -136,9 +141,10 @@ static void config_save(void) {
 
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
-                     "size=%d\nfast=%d\nrotate=%d\nimages=%d\nmargin=%d\nshowbar=%d\nrec=%d\n",
+                     "size=%d\nfast=%d\nrotate=%d\nimages=%d\nmargin=%d\nshowbar=%d\nrec=%d\n"
+                     "liststyle=%d\n",
                      g_cfg.size, g_cfg.fast, g_cfg.rotate, g_cfg.images, g_cfg.margin_pct,
-                     g_cfg.showbar, g_cfg.rec);
+                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle);
     if (n > 0 && (size_t)n < sizeof(buf) && keep.len)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s", buf_cstr(&keep));
     if (n < 0) n = 0;
@@ -221,6 +227,7 @@ int ui_config_roundtrip_test(void) {
     g_cfg.refresh[0] = 0;
     g_cfg.showbar = 1;   /* 1.2.10：默认显示（共存）。1.2.9 默认 0 曾触发看门狗重启 */
     g_cfg.rec = 6;
+    g_cfg.liststyle = 1; /* 1.2.12：默认详细（问题标题 → 摘要 → 作者赞同） */
     return loaded && kept;
 }
 
@@ -621,10 +628,16 @@ static void draw_home(void) {
 
 /* ---------------- 屏幕：列表 ---------------- */
 
+/* 1.2.12：推荐/回答列表支持简洁、详细两种布局（设置里切换）。
+ * 详细 = 问题标题 → 回答摘要 2 行 → 作者赞同，行高拉开留白充足；
+ * 简洁 = 标题 + 作者赞同，行高小、条目密，适合快速划。
+ * 摘要固定最多 2 行截断，行高恒定——高度不参差，翻页不跳。 */
+static int list_is_feed(void) {
+    return strcmp(g.list_kind, "rec") == 0 || strcmp(g.list_kind, "answers") == 0;
+}
+
 static int list_row_h(void) {
-    /* 1.2.11：回答列表（点热榜问题后看到的那个列表）每条先露 3 行摘要
-     * 预览，行高比普通列表高一大截；其余列表保持原来的紧凑两行式 */
-    if (strcmp(g.list_kind, "answers") == 0)
+    if (g_cfg.liststyle == 1 && list_is_feed())
         return g.base * 6;
     return g.base * 13 / 5;
 }
@@ -669,20 +682,26 @@ static void draw_list(void) {
         snprintf(num, sizeof(num), "%d", idx + 1);
         int numw = font_width(tpx * 3 / 4, num, (int)strlen(num));
         int tx = g.margin + numw + g.base / 2;
-        if (strcmp(g.list_kind, "answers") == 0) {
-            /* 1.2.11：回答列表——每条先露前三行摘要，看得到写得怎么样
-             * 再决定点不点进去；底部一行还是作者 · 赞同 */
-            int spx = g.base * 3 / 5;
-            int ty = y + g.base / 2 + tpx;              /* 第一行 baseline */
-            draw_wrapped_n(tx, ty, g.W - g.margin - tx, tpx, it->title, fg,
-                           3, y + rh - spx - g.base);
+        int fg3 = sel ? 170 : 130;         /* 作者·赞同：比摘要再浅一档 */
+        if (g_cfg.liststyle == 1 && list_is_feed()) {
+            /* 详细版：问题标题（加粗）→ 回答摘要（固定 2 行）→ 作者赞同 */
+            int spx = tpx * 4 / 5;
+            int ty = y + g.base / 2 + tpx;              /* 标题 baseline */
+            text_clip(tx, ty, tpx, it->title, g.W - g.margin - tx, fg, 1);
+            int sy = ty + tpx * 3 / 5 + spx;            /* 摘要第一行 baseline */
+            if (it->summary[0])
+                draw_wrapped_n(tx, sy, g.W - g.margin - tx, spx, it->summary,
+                               sel ? 210 : 70, 2, y + rh - g.base / 2);
             if (it->sub[0])
-                text_at(tx, y + rh - g.base / 2 - spx, spx, it->sub, fg2, 0);
+                text_at(tx, y + rh - g.base / 2 - tpx * 3 / 5, tpx * 3 / 5,
+                        it->sub, fg3, 0);
         } else {
+            /* 简洁版：标题一行（加粗）+ 作者赞同浅灰；其他列表维持原样 */
+            int bold_title = list_is_feed();
             int baseline = y + rh / 3;
             text_at(g.margin, baseline, tpx * 3 / 4, num, fg2, 0);
             text_clip(tx, baseline, tpx, it->title,
-                      g.W - 2 * g.margin - numw - g.base / 2, fg, sel);
+                      g.W - 2 * g.margin - numw - g.base / 2, fg, bold_title ? 1 : sel);
             if (it->sub[0]) {
                 int spx = g.base * 3 / 5;
                 text_clip(tx, y + rh - spx, spx, it->sub,
@@ -739,8 +758,11 @@ static int reader_pad(void) { return g.base * 2 / 3; }
 /* 1.2.7：阅读页标题比列表页页眉明显大一档（粗体，1.2 倍正文）。
  * 页眉跟着加高，否则放大后的标题会压到正文第一行上。
  * 1.2.11：标题自动折行完整显示（原来一行截断加省略号，长标题
- * 根本看不出问的是什么），最多 3 行，页眉高度跟着行数走。 */
-#define READER_TITLE_MAX_LINES 3
+ * 根本看不出问的是什么）。
+ * 1.2.12：用户反馈 3 行仍截断（知乎长问题标题可到 100+ 字），
+ * 上限放开到 8 行——问题标题必须完整显示。8 行是防呆上限
+ * （base=36 时页眉约 430px，KO3 屏高 1680，正文区仍够一屏）。 */
+#define READER_TITLE_MAX_LINES 8
 static int g_title_lines = 1;
 static int g_title_more = 0;                        /* 折满 3 行仍有剩余 */
 static int g_title_seg[READER_TITLE_MAX_LINES][2];  /* 每行在 doc_title 里的字节区间 */
@@ -767,7 +789,7 @@ static void reader_title_layout(void) {
         uint32_t prev = 0;
         if (lines == READER_TITLE_MAX_LINES - 1 &&
             font_width(px, s + pos, len - pos) > avail)
-            room = avail - g.base;             /* 最后还剩内容时给"…"留位 */
+            room = avail - g.base;             /* 极端超长（>8 行）才给"…"留位 */
         while (i < len) {
             uint32_t cp;
             int n = u8_decode(s + i, (size_t)(len - i), &cp);
@@ -1089,9 +1111,9 @@ static void draw_settings(void) {
 
     static const char *names[] = {
         "正文字号", "翻页刷屏", "界面旋转", "显示图片", "页边距",
-        "推荐条数", "系统状态栏", "重新排版", "清空缓存", "返回首页",
+        "推荐条数", "列表样式", "系统状态栏", "重新排版", "清空缓存", "返回首页",
     };
-    char vals[10][64];
+    char vals[11][64];
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.size == 0 ? "小" : (g_cfg.size == 1 ? "中" : "大"));
     /* 1.2.8：fast 不再等于"用 DU 波形"（那是残影和字发虚的根），
      * 而是"翻页要不要整屏闪一下"。默认不闪（局部 + GC16），画面本身是干净的。
@@ -1105,14 +1127,17 @@ static void draw_settings(void) {
     snprintf(vals[3], sizeof(vals[3]), "%s", imgmodes[g_cfg.images]);
     snprintf(vals[4], sizeof(vals[4]), "%d%%", g_cfg.margin_pct);
     snprintf(vals[5], sizeof(vals[5]), "%d 条", g_cfg.rec);
-    snprintf(vals[6], sizeof(vals[6]), "%s", g_cfg.showbar ? "显示（推荐）" : "隐藏（压屏）");
-    snprintf(vals[7], sizeof(vals[7]), "重新分页");
-    snprintf(vals[8], sizeof(vals[8]), "含图片缓存");
-    vals[9][0] = 0;
+    /* 1.2.12：推荐/回答列表两种布局 */
+    snprintf(vals[6], sizeof(vals[6]), "%s",
+             g_cfg.liststyle ? "详细（标题+摘要）" : "简洁（标题行高小）");
+    snprintf(vals[7], sizeof(vals[7]), "%s", g_cfg.showbar ? "显示（推荐）" : "隐藏（压屏）");
+    snprintf(vals[8], sizeof(vals[8]), "重新分页");
+    snprintf(vals[9], sizeof(vals[9]), "含图片缓存");
+    vals[10][0] = 0;
 
     int rh = set_row_h();
     int y = g.header_h;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 11; i++) {
         if (i == g.list_sel) {
             fb_fill(&g.fb, 0, y, g.W, rh, 0);
         }
@@ -3130,6 +3155,15 @@ static void handle_tap(int x, int y) {
                 g_cfg.rec = (g_cfg.rec == 6) ? 12 : (g_cfg.rec == 12 ? 18 : 6);
                 config_save();
             } else if (i == 6) {
+                /* 1.2.12：列表样式 简洁 <-> 详细，即时生效（下次画列表就用） */
+                g_cfg.liststyle = g_cfg.liststyle ? 0 : 1;
+                config_save();
+                if (g_cfg.liststyle)
+                    show_message("列表样式：详细。\n\n每条显示：问题标题 → 回答摘要（2 行）→ 作者赞同。\n行高拉开、留白充足，适合慢慢看。");
+                else
+                    show_message("列表样式：简洁。\n\n每条只显示问题标题 + 作者赞同。\n行高小、条目密，适合快速划。");
+                return;
+            } else if (i == 7) {
                 /* 1.2.10：系统状态栏与 framework 解耦。隐藏=共存+屏幕守护
                  * 压顶栏（顶栏偶尔闪现，秒级被回灌压掉），不再杀 cvm——
                  * 1.2.9 的 framework=stop 被 framework 看门狗判死、
@@ -3144,9 +3178,9 @@ static void handle_tap(int x, int y) {
                     show_message("系统状态栏：显示（推荐）。\n\n与 Kindle 系统界面共存，"
                                  "顶栏偶尔会盖到画面上。\n退出并重新打开后生效。");
                 return;
-            } else if (i == 7) {
-                if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
             } else if (i == 8) {
+                if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
+            } else if (i == 9) {
                 long n = api_cache_clear();
                 show_message("已删除 %ld 个缓存文件\n（含图片缓存，全部文章的都清掉了）", n);
                 return;

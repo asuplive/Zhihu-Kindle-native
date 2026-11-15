@@ -572,8 +572,9 @@ static int run_selftest(void) {
         ok ? pass++ : fail++;
     }
 
-    /* 回答列表标题：一个问题下多个回答时，每行必须是"这一条回答的摘要"，
-     * 1.2.5 全都退化成问题标题，整页看起来像复制粘贴。 */
+    /* 回答列表条目（1.2.12）：标题=问题标题（用户要求以问题优先展示），
+     * 摘要独立进 summary（详细模式画在标题下面，2 行预览）。
+     * 1.2.5-1.2.11 曾把摘要当标题；1.2.12 按用户反馈反转。 */
     {
         const char *j = "{\"data\":[{\"type\":\"answer\",\"id\":2103784826771862921,"
                         "\"excerpt\":\"先说结论：这不是手机变贵了\","
@@ -584,9 +585,10 @@ static int run_selftest(void) {
         int r = api_parse_feed(j, strlen(j), &l);
         ok = r == 0 && l.n == 1 &&
              strcmp(l.v[0].id, "2103784826771862921") == 0 &&
-             strstr(l.v[0].title, "先说结论") != NULL &&
-             strcmp(l.v[0].title, "为什么手机越来越贵") != 0;
-        printf("[ans  ] %s 回答列表用摘要当标题（而不是重复问题标题）\n", ok ? "OK" : "FAIL");
+             strcmp(l.v[0].title, "为什么手机越来越贵") == 0 &&
+             strstr(l.v[0].summary, "先说结论") != NULL &&
+             l.v[0].voteup == 88;
+        printf("[ans  ] %s 回答条目：标题=问题标题、摘要进 summary（1.2.12 问题优先）\n", ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
         api_list_free(&l);
     }
@@ -602,8 +604,9 @@ static int run_selftest(void) {
         memset(&l, 0, sizeof(l));
         int r = api_parse_feed(j, strlen(j), &l);
         ok = r == 0 && l.n == 1 && strcmp(l.v[0].id, "2103784826771862921") == 0 &&
-             strstr(l.v[0].title, "收藏的回答") != NULL && l.v[0].voteup == 7;
-        printf("[fav  ] %s 收藏夹内容的 content 包装能钻进去解析\n", ok ? "OK" : "FAIL");
+             strcmp(l.v[0].title, "问题") == 0 &&
+             strstr(l.v[0].summary, "收藏的回答") != NULL && l.v[0].voteup == 7;
+        printf("[fav  ] %s 收藏夹内容的 content 包装能钻进去解析（标题/摘要分立）\n", ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
         api_list_free(&l);
     }
