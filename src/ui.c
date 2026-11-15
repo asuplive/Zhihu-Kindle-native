@@ -20,6 +20,7 @@
 #include "net.h"
 #include "qr.h"
 #include "social.h"
+#include "statusbar.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -44,9 +45,11 @@ typedef struct {
      * 用户改一次字号就把这行冲掉了，下次启动又退回到会重启的刷新路径。 */
     char refresh[8];
     /* 1.2.10：showbar 与 framework 彻底解耦。顶栏（时间/网络/电量）是
-     * cvm 画的，1.2.9 曾用"杀 cvm"来隐藏它——cvm 一死 framework 看门狗
-     * 就在宽限期后整机重启（真机实测两次）。现在 showbar=0 只表示
-     * "共存 + 屏幕守护压顶栏"，不再碰 framework。默认 1（显示，推荐）。 */
+     * awesome/cvm 画的，1.2.9 曾用"杀 cvm"来隐藏它——cvm 一死 framework
+     * 看门狗就在宽限期后整机重启（真机实测两次）。
+     * 1.2.14：换成正面方案——禁 pillow + SIGSTOP awesome（KOReader 同款，
+     * 不碰 cvm，无看门狗风险），showbar=0 终于可以默认开。
+     * 默认 0（隐藏，推荐）。压屏守护保留作兜底。 */
     int showbar;
     /* 推荐列表条数：6/12/18（6 的倍数，最多 18） */
     int rec;
@@ -225,7 +228,8 @@ int ui_config_roundtrip_test(void) {
     g_cfg.images = 0;
     g_cfg.margin_pct = 7;
     g_cfg.refresh[0] = 0;
-    g_cfg.showbar = 1;   /* 1.2.10：默认显示（共存）。1.2.9 默认 0 曾触发看门狗重启 */
+    g_cfg.showbar = 0;   /* 1.2.14：默认隐藏（禁 pillow + 暂停 awesome，安全可逆）。
+                          * 1.2.9 默认 0 曾因"杀 cvm"触发看门狗重启，方案已更换 */
     g_cfg.rec = 6;
     g_cfg.liststyle = 1; /* 1.2.12：默认详细（问题标题 → 摘要 → 作者赞同） */
     return loaded && kept;
@@ -699,17 +703,19 @@ static void draw_list(void) {
         snprintf(num, sizeof(num), "%d", idx + 1);
         int numw = font_width(tpx * 3 / 4, num, (int)strlen(num));
         int tx = g.margin + numw + g.base / 2;
-        int fg3 = sel ? 170 : 130;         /* 作者·赞同：比摘要再浅一档 */
+        int fg3 = sel ? 200 : 130;         /* 作者·赞同：比摘要再浅一档 */
         if (strcmp(g.list_kind, "answers") == 0) {
             /* 1.2.13：回答列表不再显示问题标题——页眉上已经是这个问题了，
              * 每条再显示一遍纯属重复（真机反馈）。每条 = 回答摘要
              * （最多 3 行，是这一条的主体内容）+ 作者·赞同。 */
+            /* 1.2.14：选中态必须是白字——之前摘要画的是 sel?0:30，
+             * 黑底配黑字，选中行整块全黑什么都看不见（真机截图实锤）。 */
             int spx = tpx * 4 / 5;
             const char *sum = it->summary[0] ? it->summary : it->title;
             int ty = y + g.base / 2 + spx;              /* 摘要第一行 baseline */
             if (sum && *sum)
                 draw_wrapped_n(tx, ty, g.W - g.margin - tx, spx, sum,
-                               sel ? 0 : 30, 3, y + rh - g.base / 2);
+                               sel ? 255 : 30, 3, y + rh - g.base / 2);
             if (it->sub[0])
                 text_at(tx, y + rh - g.base / 2 - tpx * 3 / 5, tpx * 3 / 5,
                         it->sub, fg3, 0);
@@ -1160,7 +1166,7 @@ static void draw_settings(void) {
     /* 1.2.12：推荐/回答列表两种布局 */
     snprintf(vals[6], sizeof(vals[6]), "%s",
              g_cfg.liststyle ? "详细（标题+摘要）" : "简洁（标题行高小）");
-    snprintf(vals[7], sizeof(vals[7]), "%s", g_cfg.showbar ? "显示（推荐）" : "隐藏（压屏）");
+    snprintf(vals[7], sizeof(vals[7]), "%s", g_cfg.showbar ? "显示" : "隐藏（推荐）");
     snprintf(vals[8], sizeof(vals[8]), "重新分页");
     snprintf(vals[9], sizeof(vals[9]), "含图片缓存");
     vals[10][0] = 0;
@@ -3301,19 +3307,22 @@ static void handle_tap(int x, int y) {
                     show_message("列表样式：简洁。\n\n每条只显示问题标题 + 作者赞同。\n行高小、条目密，适合快速划。");
                 return;
             } else if (i == 7) {
-                /* 1.2.10：系统状态栏与 framework 解耦。隐藏=共存+屏幕守护
-                 * 压顶栏（顶栏偶尔闪现，秒级被回灌压掉），不再杀 cvm——
-                 * 1.2.9 的 framework=stop 被 framework 看门狗判死、
-                 * 宽限期后整机重启。重启程序后生效（start.sh 读 config）。 */
+                /* 1.2.14：状态栏隐藏换成正面方案——禁 chrome pillow +
+                 * SIGSTOP awesome（KOReader 真机验证多年的同款方法），
+                 * 全程不碰 cvm，无 framework 看门狗风险，且即时生效。
+                 * 顶栏的时间/电量由 awesome 画：pillow 禁了它就不再画，
+                 * awesome 停了时钟也不会再刷新；压屏守护保留作兜底。 */
                 g_cfg.showbar = g_cfg.showbar ? 0 : 1;
                 config_save();
-                if (g_cfg.showbar == 0)
-                    show_message("系统状态栏：隐藏（压屏）。\n\n顶栏的时间/网络/电量出现后\n"
-                                 "会被屏幕守护自动压掉（几秒内）。\n不杀系统界面，不会触发整机重启。\n\n"
-                                 "退出本应用并从 KUAL 重新打开后生效。");
-                else
-                    show_message("系统状态栏：显示（推荐）。\n\n与 Kindle 系统界面共存，"
-                                 "顶栏偶尔会盖到画面上。\n退出并重新打开后生效。");
+                if (g_cfg.showbar == 0) {
+                    statusbar_hide();
+                    show_message("系统状态栏：隐藏。\n\n已立即生效：系统不再画\n"
+                                 "时间/网络/电量顶栏。\n不杀系统界面，退出时自动恢复。");
+                } else {
+                    statusbar_restore();
+                    show_message("系统状态栏：显示。\n\n已立即恢复：Kindle 顶栏\n"
+                                 "（时间/网络/电量）回来了。");
+                }
                 return;
             } else if (i == 8) {
                 if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
@@ -3619,12 +3628,47 @@ static void sim_dm_read_demo(void) {
     dm_build_doc();
 }
 
+/* 仅交互模拟器可用（ZH_SIM_LIVE）：离线注入一个「回答列表」。
+ * 知乎对「问题 → 回答列表」接口对游客 403 风控，联网路径验证不了，
+ * 1.2.14 起提供离线版本：第 1 条默认选中，用来核对黑底白字反色、
+ * 3 行摘要截断与作者行灰度。真机上永不触发。 */
+static void sim_answers_demo(void) {
+    if (!getenv("ZH_SIM_LIVE")) return;
+    list_reset("S16 总决赛 BLG 3:1 击败 GEN，如何评价这场比赛？", "answers");
+    g.list.v = xcalloc(6, sizeof(ApiItem));
+    g.list.cap = g.list.n = 6;
+    static const char *sums[] = {
+        "我们是冠军！！！恭喜BLG！！！五年了，真的等了五年了。这五年我们LPL赛区是怎么过来的，BLG不会再让2024年的遗憾再现。",
+        "\"这不是lpl对lck，这是BLG对抗整个lck！\"击败，横扫，碾压！一穿四！打穿整个LCK，你就是世界最强战队！",
+        "LPL等这个冠军等的太久了，时隔五年终于拿到了。blg完成了一次史无前例的壮举，一穿四打败了所有的LCK队伍。",
+        "这几年唯一撑起国产中单牌面的人，毫无疑问是LPL的goat。左手开创性也因左手自出道以后为LPL带来的数次国际赛事冠军。",
+        "第三把放弃狐狸选维克托，真的是扛起责任了。第四把下路炸了，卡牌超快发育，硬是把劣势顶了回去。",
+        "顺便辟谣一下，本人从未发表过对陈泽彬先生任何不良言论，本人一直认为陈泽彬先生是世界第一上单。",
+    };
+    static const char *subs[] = {
+        "清人风 · 1156 赞同", "窝苔观影 · 729 赞同", "临高海步一般兵 · 296 赞同",
+        "Tawen · 261 赞同", "贪吃的小白 · 40 赞同", "驰骋疆场 · 244 赞同",
+    };
+    for (int i = 0; i < 6; i++) {
+        snprintf(g.list.v[i].id, sizeof(g.list.v[i].id), "demo-ans-%d", i + 1);
+        snprintf(g.list.v[i].summary, sizeof(g.list.v[i].summary), "%s", sums[i]);
+        snprintf(g.list.v[i].sub, sizeof(g.list.v[i].sub), "%s", subs[i]);
+        g.list.v[i].type = 1;
+        g.list.v[i].voteup = 100 + i;
+    }
+    g.list_sel = 0;
+    g.list_top = 0;
+    g.scr = SCR_LIST;
+    draw_list();
+}
+
 static void handle_key(int code) {
     if (code == 997) { sim_demo_open(); return; }
     if (code == 993) { sim_empty_demo(); return; }
     if (code == 996) { sim_qr_demo(); return; }
     if (code == 995) { sim_dm_list_demo(); return; }
     if (code == 994) { sim_dm_read_demo(); return; }
+    if (code == 992) { sim_answers_demo(); return; }
     if (code == 999) { g.quit = 1; return; }
     switch (g.scr) {
         case SCR_DMREAD:
@@ -3828,6 +3872,11 @@ int app_run(void) {
                      "请在 config.txt 里加一行 framework=stop 后重开。");
         g.msg_until = now_ms_ui() + 8000;
     }
+    /* 1.2.14：showbar=0（默认）→ 启动即正面隐藏系统状态栏：
+     * 禁 chrome pillow + 暂停 awesome（WM）。放在首帧之后，启动不被 lipc 拖慢，
+     * 首帧到隐藏之间的空窗由屏幕守护兜底。 */
+    if (!g_cfg.showbar) statusbar_hide();
+
     logmsg("app_run: 进入主循环");
 
     long hb = now_ms_ui();
@@ -3994,6 +4043,9 @@ int app_run(void) {
                     /* 挂起回来 EPDC 可能黑屏，补一次 unblank + 重画 */
                     fb_after_resume(&g.fb);
                     redraw_current();
+                    /* 1.2.14：唤醒后 framework 可能重新拉起顶栏/恢复 awesome，
+                     * 幂等地再压一次（statusbar_hide 内部会检查 awesome 状态） */
+                    if (!g_cfg.showbar) statusbar_hide();
                 }
                 /* 列表条数和登录态一起记：真机上"页=1/0"到底是没进阅读页，
                  * 还是进了但排版结果为空，看这两个值就能区分。
@@ -4050,6 +4102,10 @@ int app_run(void) {
 
     qr_stop();
     img_stop();
+    /* 1.2.14：showbar=0 时把系统状态栏还回来（pillow enable + awesome
+     * SIGCONT）。正常退出必须恢复，否则退出后 Kindle 顶栏一直是死的。
+     * 放在画"已退出"提示之前——提示文案里说的"系统界面即将恢复"就是它。 */
+    statusbar_restore();
     logmsg("app_run: 用户退出");
     fb_clear(&g.fb, 255);
     text_at(g.margin, g.base * 2, g.base, "知乎阅读已退出", 0, 1);

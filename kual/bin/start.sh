@@ -20,6 +20,7 @@
 # 排障开关（写进 /mnt/us/zhihu/config.txt，不用重新编译）：
 #   framework=auto|none|stop|pause   默认 auto（按触摸独占探测决定）
 #   wake=auto|off                    默认 auto（wakelock + lipc 双保险）
+#   showbar=0|1                      默认 0（1.2.14：隐藏顶栏=禁 pillow+暂停 awesome）
 #   refresh=auto|mxcfb|eips|none|blank|pan   见 README
 #   eips=auto|image|flash|off
 #   blankpulse=0|1
@@ -105,6 +106,36 @@ powerd_nudge() {
     lipc-set-prop -i com.lab126.powerd deferSuspend 1 2>/dev/null
 }
 
+# ---------------- 1.2.14：状态栏隐藏的脚本侧兜底 ----------------
+# showbar=0 时程序自己会：禁 chrome pillow + SIGSTOP awesome（KOReader 同款，
+# 不碰 cvm，无看门狗风险），并把 awesome pid 写进 .awesome_stopped。
+# 脚本在这里做两件事：
+#   reassert —— 每 5 秒一次（挂在 keepawake_loop 里）：唤醒后 framework 可能
+#               把顶栏/awesome 恢复回去，发现 awesome 在跑就重新压住；
+#   cleanup  —— 程序没来得及自己恢复（崩溃/被杀）时兜底还原。
+AWESOME_MARK="$DATA/.awesome_stopped"
+
+awesome_reassert() {   # 仅 showbar=0 时调用
+    [ -f "$AWESOME_MARK" ] || return 0
+    lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
+    AP=$(cat "$AWESOME_MARK" 2>/dev/null)
+    [ -n "$AP" ] || return 0
+    ST=$(sed -n 's/.*) \([A-Z]\) .*/\1/p' "/proc/$AP/stat" 2>/dev/null)
+    if [ "$ST" != "T" ]; then
+        kill -STOP "$AP" 2>/dev/null && log "awesome(pid=$AP) 被系统恢复过，重新暂停（状态=$ST）"
+    fi
+}
+
+awesome_restore() {
+    if [ -f "$AWESOME_MARK" ]; then
+        AP=$(cat "$AWESOME_MARK" 2>/dev/null)
+        [ -n "$AP" ] && kill -CONT "$AP" 2>/dev/null
+        lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
+        rm -f "$AWESOME_MARK"
+        log "恢复：awesome(pid=$AP) SIGCONT + pillow enable（脚本兜底）"
+    fi
+}
+
 # 每 5 秒补一次。lipc 全失败说明 powerd 不理我们（或者根本没起来），
 # 这时把结论写进日志——下次看日志就知道该指望 wakelock 还是 lipc。
 keepawake_loop() {
@@ -120,6 +151,7 @@ keepawake_loop() {
                 log "WARN: powerd 不响应 lipc（$fails 次），防休眠只能靠 wakelock=[$WAKE_FILE]"
             fi
         fi
+        [ "$SB_HIDE" = "1" ] && awesome_reassert
         guard_framework
         sleep 5
     done
@@ -360,6 +392,7 @@ restore_framework() {
 cleanup() {
     rm -f "$WANT_STOP"
     release_wake
+    awesome_restore
     [ -n "$KEEP_PID" ] && kill $KEEP_PID 2>/dev/null
     [ -n "$EXPIRE_PID" ] && kill $EXPIRE_PID 2>/dev/null
     [ -n "$KMSG_PID" ] && kill $KMSG_PID 2>/dev/null
@@ -448,12 +481,15 @@ spy)
 
     # 探测必须在动 framework 之前：探测结果决定要不要动它
     # 1.2.10：showbar 与 framework 彻底解耦（1.2.9 的教训：showbar=0 时杀 cvm，
-    # framework 看门狗在宽限期后整机重启，run.log 用 boot_id 自证了两次）。
-    # showbar=0（隐藏顶栏）不再碰 cvm：共存模式 + 程序内屏幕守护（影子回灌，
-    # 120ms 一拍）把顶栏残留压回去。顶栏可能偶尔闪现，几秒内被压回。
-    SB=$(cfg_get showbar 1)
+    # framework 看门狗在宽限期后整机重启）。
+    # 1.2.14：状态栏隐藏换成正面方案——程序内禁 chrome pillow + SIGSTOP
+    # awesome（KOReader 同款，不碰 cvm，无看门狗风险），默认 showbar=0；
+    # 压屏守护保留作兜底，脚本侧每 5 秒重压一次（唤醒后 framework 恢复顶栏时）。
+    SB=$(cfg_get showbar 0)
+    SB_HIDE=0
+    [ "$SB" = "0" ] && SB_HIDE=1
     if [ "$SB" = "0" ]; then
-        log "showbar=0：隐藏顶栏=共存+压屏（1.2.10 起不杀 cvm，避免 framework 看门狗整机重启）"
+        log "showbar=0：隐藏顶栏=禁 pillow + 暂停 awesome（1.2.14 正面方案，不杀 cvm）"
     fi
     resolve_mode
     log "config: framework=$CF_MODE（原始值 $(cfg_get framework auto)）refresh=$(cfg_get refresh auto) eips=$(cfg_get eips auto) showbar=$SB rec=$(cfg_get rec 6)"

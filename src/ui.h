@@ -3,7 +3,7 @@
 #define ZH_UI_H
 
 /* 全局版本号：main.c 与界面共用，改一处即可 */
-#define ZH_VERSION "1.2.13"
+#define ZH_VERSION "1.2.14"
 
 int app_run(void);
 int app_preview(const char *html_path, int max_pages);

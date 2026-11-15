@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.13"
+VER = "1.2.14"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -221,8 +221,9 @@ def main():
     # 1.2.9：状态栏开关、推荐条数、PNG/WebP、文章分目录缓存、Regal、
     #         旋转跟随、私信端点修正、KUAL 精简、标题只在第一页
     check("showbar" in uic, "ui.c 设置里有「系统状态栏」开关（showbar）")
-    check("showbar" in sh, "start.sh 读 showbar（1.2.10 起仅共存压屏，不再映射 framework=stop）")
-    check("showbar=0：隐藏顶栏=共存+压屏" in sh, "start.sh 不再因 showbar=0 杀 cvm（1.2.9 看门狗重启回归的修复）")
+    check("showbar" in sh, "start.sh 读 showbar（1.2.14 起正面隐藏：pillow+awesome，仍不杀 cvm）")
+    check("awesome_reassert" in sh and "awesome_restore" in sh and ".awesome_stopped" in sh,
+          "start.sh 每 5 秒重压 + cleanup 兜底恢复（1.2.14 正面方案，无看门狗风险）")
     check(".want_stop" in sh and "自动升级 stop 已移除" in sh, "start.sh 已移除 .want_stop 自动升级 stop 机制")
     check(".want_stop" not in uic or "已废弃" in uic, "ui.c 不再写 .want_stop（1.2.10 不主动请求杀 cvm）")
     check("g_cfg.rec" in uic and "rec=%d" in uic, "ui.c 推荐条数 6/12/18 可配置并写回 config")
@@ -255,7 +256,8 @@ def main():
     check("即将 SEND_UPDATE" in fbc, "fb.c SEND_UPDATE 前写 breadcrumb（panic 定位）")
     check("FBIOPAN_DISPLAY branch" in fbc and "#warning" in fbc, "fb.c FBIOPAN 分支编译期警示")
     check("fw=%s" in uic, "ui.c 心跳带 framework 状态（fw=coexist/stop Ns）")
-    check('g_cfg.showbar = 1' in uic, "ui.c showbar 默认值改回 1（显示/共存）")
+    check('g_cfg.showbar = 0;' in uic and "默认隐藏" in uic,
+          "ui.c showbar 默认 0（1.2.14 正面方案已无看门狗风险）")
 
     # 1.2.11：真机三修——排版空页、标题折行、回答列表三行预览
     layc = z.read(base + "source/src/layout.c").decode("utf-8", "replace")
@@ -318,6 +320,31 @@ def main():
     check('strcmp(g.list_kind, "answers") == 0) {' in uic and
           "页眉上已经是这个问题了" in uic,
           "ui.c 回答列表去掉重复问题标题（摘要为主，推荐列表不变）")
+
+    # 1.2.14：两修——选中反色（黑底白字）、状态栏正面隐藏（pillow+awesome）
+    check("sel ? 255 : 30" in uic and "黑底配黑字" in uic,
+          "ui.c 回答列表选中态摘要=白字（1.2.13 曾黑底黑字不可见）")
+    check("int fg3 = sel ? 200 : 130;" in uic,
+          "ui.c 选中态作者行灰度提高（170→200）")
+    sbar = z.read(base + "source/src/statusbar.c").decode("utf-8", "replace")
+    sbarh = z.read(base + "source/src/statusbar.h").decode("utf-8", "replace")
+    check("disableEnablePillow" in sbar and '"disable"' in sbar and '"enable"' in sbar,
+          "statusbar.c 禁用/恢复 chrome pillow（KOReader 同款正面方案）")
+    check("SIGSTOP" in sbar or ("kill(pid" in sbar and "SIGSTOP" in sbarh) or "SIGSTOP" in sbarh,
+          "statusbar.c/h SIGSTOP awesome（FW>=5.7.2 时钟仍会刷新，必须停 WM）")
+    check("SIGCONT" in sbar and ".awesome_stopped" in sbar,
+          "statusbar.c 退出恢复=SIGCONT+标记文件（崩溃/脚本两条兜底路都认它）")
+    check('"awesome" == ' not in sbar and 'strcmp(buf, "awesome")' in sbar,
+          "statusbar.c 扫 /proc 找 awesome（不依赖 pidof）")
+    check("statusbar_hide();" in uic and "statusbar_restore();" in uic and
+          "statusbar_restore_safe();" in mnc and "statusbar_restore();" in mnc,
+          "接线完整：ui.c 启动隐藏/退出恢复，main.c 退出与崩溃兜底")
+    check("awesome_reassert" in z.read(base + "extensions/zhihureader/bin/start.sh").decode("utf-8", "replace") and
+          "awesome_restore" in z.read(base + "extensions/zhihureader/bin/start.sh").decode("utf-8", "replace"),
+          "start.sh 每 5 秒重压（唤醒后 framework 恢复顶栏时）+ cleanup 兜底恢复")
+    check('"anslist"' in z.read(base + "source/src/input.c").decode("utf-8", "replace") and
+          "sim_answers_demo" in uic,
+          "模拟器离线注入回答列表（知乎游客 403，回归需要离线数据）")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

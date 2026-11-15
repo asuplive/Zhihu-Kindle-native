@@ -97,6 +97,7 @@ static int parse_sim_line(const char *line, Ev *e) {
     else if (strcmp(cmd, "dmlist") == 0) { e->type = ZH_KEY;     e->code = 995; }
     else if (strcmp(cmd, "dmread") == 0) { e->type = ZH_KEY;     e->code = 994; }
     else if (strcmp(cmd, "empty") == 0)  { e->type = ZH_KEY;     e->code = 993; }
+    else if (strcmp(cmd, "anslist") == 0){ e->type = ZH_KEY;     e->code = 992; }
     else return 0;
     return 1;
 }

@@ -18,6 +18,7 @@
 #include "png.h"
 #include "qr.h"
 #include "social.h"
+#include "statusbar.h"
 #include "ui.h"
 #include "json.h"
 #include "layout.h"
@@ -92,6 +93,13 @@ static void run_quiet(const char *prog, const char *a1, const char *a2,
 static void restore_system_ui(int safe) {
     char p[320];
 
+    /* 0) 1.2.14：showbar=0 时被暂停的 awesome + 禁用的 pillow。
+     * 两条恢复路都要做：SIGCONT 是信号安全的；lipc enable 只在
+     * 非信号上下文里跑（fork 在 SIGALRM 里不严格安全，能不做就不做）。 */
+    statusbar_restore_safe();
+    if (!safe)
+        statusbar_restore();
+
     /* 1) 被冻结的 cvm：放它回来。
      * 即使不是我们冻的（文件不存在）也只是白读一次，幂等。 */
     snprintf(p, sizeof(p), "%s/.cvm_frozen", zh_home());
@@ -162,6 +170,9 @@ static void on_fatal(int sig, siginfo_t *si, void *uc_) {
                      "*** CRASH sig=%d (%s) addr=%p pc=%08lx lr=%08lx sp=%08lx ver=%s\n",
                      sig, nm, si ? si->si_addr : (void *)0, pc, lr, sp, ZH_VERSION);
     if (n > 0) crash_log(buf, n);
+    /* 1.2.14：showbar=0 时被暂停的 awesome——崩溃退出前放回来，
+     * 不然程序崩了顶栏还死着（退出提示都来不及画）。 */
+    statusbar_restore_safe();
     /* 1.2.10：崩溃也要把 framework 恢复掉（如果是我们停的）——
      * cvm 死着 + 进程死了 = 没人喂看门狗，宽限期后整机重启，
      * 用户连崩溃日志都来不及看。fork+execvp 在信号处理器里不严格
@@ -556,6 +567,23 @@ static int run_selftest(void) {
         printf("[rvr  ] %s 退出时按 .cvm_frozen 恢复 cvm 并清理标记\n", ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
         unlink(p);
+    }
+
+    /* 状态栏隐藏/恢复的标记往返（1.2.14）：
+     * host 上没有 awesome/lipc，hide() 走"什么都没找到"分支——这正好验证
+     * 幂等与标记文件的生命周期：hide 落标记（pid=0），
+     * restore_safe 读标记、SIGCONT 跳过（pid=0）、清标记。
+     * 真机上 awesome 的 SIGSTOP/SIGCONT 语义和这里 kill(0) 的分支同源。 */
+    {
+        statusbar_hide();
+        char mp[320];
+        snprintf(mp, sizeof(mp), "%s/.awesome_stopped", zh_home());
+        int marked = file_exists(mp);
+        statusbar_restore_safe();
+        ok = marked && !file_exists(mp);
+        printf("[sbar] %s hide 落标记 -> restore_safe 清标记（无 awesome 环境幂等）\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
     }
 
     /* 翻页键独占规则：翻页键闪出原生主页就是这里没做对。
