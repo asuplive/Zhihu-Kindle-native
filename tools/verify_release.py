@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.3.0"
+VER = "1.3.1"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -301,6 +301,11 @@ def main():
           "ui.c 进入问题列表/收藏内容前先存上一层")
     check("if (code == 158 || code == 102) nav_back();" in uic,
           "ui.c 物理返回键在列表页也走层级返回")
+    check("static void loading_scr_restore(void);" in uic and
+          "loading_scr_restore();\n    return 0;" in uic,
+          "ui.c run_job 成功路径恢复 scr（1.3.1：LOADING 态未恢复导致 push_parent 被拒、回答列表返回直回主页的根因）")
+    check("g.scr = SCR_LOADING;\n    loading_scr_restore();\n    ok = ok && g.scr == SCR_LIST;" in uic,
+          "ui.c [nav] 自检钉死 LOADING 恢复→push 链路")
     check("g.scr = SCR_READER;" in uic and
           "成功路径如果不换回来" in uic,
           "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")

@@ -423,6 +423,7 @@ static void draw_account(void);
 static void draw_qrcode(void);
 static void draw_settings(void);
 static void show_loading(const char *text, int cancellable);
+static void loading_scr_restore(void);   /* 1.3.1：LOADING 态恢复到任务前界面 */
 static void show_message(const char *fmt, ...);
 static void open_history(void);
 static void act_account(void);
@@ -2047,6 +2048,9 @@ static int run_job(JobFn fn, void *arg, const char *title, const char *tag,
         if (!err[0]) snprintf(err, errsz, "请求失败");
         return -1;
     }
+    /* 1.3.1：成功路径把 scr 从加载页放回任务前的界面。
+     * 失败路径保持原状（调用方 show_message 的 scr_prev 逻辑会兜住）。 */
+    loading_scr_restore();
     return 0;
 }
 
@@ -2126,6 +2130,25 @@ int ui_nav_stack_test(void) {
          g.list.v == NULL && g.list.n == 0 &&
          g.parent_sel == 1 && strcmp(g.parent_kind, "hot") == 0;
 
+    /* 1.3.1 回归钉子（真机实锤的层级返回失效根因）：
+     * run_job -> show_loading 把 scr 换成 LOADING 且成功路径不恢复，
+     * act_question 里的 push 就被 g.scr != SCR_LIST 守卫拒绝——
+     * 热榜快照没进栈，回答列表返回直接回主页。
+     * 现在恢复函数必须在 push 前把 scr 放回 LIST。 */
+    list_pop_parent();
+    g.scr_prev = SCR_LIST;
+    g.scr = SCR_LOADING;
+    loading_scr_restore();
+    ok = ok && g.scr == SCR_LIST;
+    /* LOADING 态直接 push 必须被拒（防止有人顺手删掉守卫） */
+    g.scr = SCR_LOADING;
+    list_push_parent();
+    ok = ok && g.parent_valid == 0;
+    /* 复原到"已压栈"状态，让后续既有断言继续走 */
+    g.scr = SCR_LIST;
+    list_push_parent();
+    ok = ok && g.parent_valid == 1;
+
     /* 模拟 list_reset 后装了子列表 */
     api_list_free(&g.list);
     memset(&g.list, 0, sizeof(g.list));
@@ -2182,6 +2205,18 @@ static void show_loading(const char *text, int cancellable) {
     g.load_cancellable = cancellable;
     g.scr = SCR_LOADING;
     draw_loading();
+}
+
+/* 1.3.1：run_job 成功后把界面状态从"加载页"放回任务前的界面。
+ * 根因实锤（真机反馈"回答列表返回直接回主页"）：run_job -> show_loading
+ * 把 g.scr 换成 SCR_LOADING 且成功路径从不恢复，随后 act_question 里
+ * list_push_parent 的 g.scr != SCR_LIST 守卫拒绝压栈——热榜快照根本
+ * 没进层级栈，返回键只能一路回主页。1.2.13 的层级返回在这条真实
+ * 链路上从未生效（自检手动设了 scr，绕过了这条链，没拦住）。
+ * 提取成函数供 [nav] 自检钉死。scr_prev 不会是 LOADING/MESSAGE
+ * （show_message 明确跳过这两个），所以恢复目标总是真实界面。 */
+static void loading_scr_restore(void) {
+    if (g.scr == SCR_LOADING) g.scr = g.scr_prev;
 }
 
 static void show_message(const char *fmt, ...) {
