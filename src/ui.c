@@ -277,6 +277,7 @@ typedef struct {
 
     int scr;
     int scr_prev;
+    int load_scr_prev;   /* 1.3.2：进加载页前的真实界面（层级返回的命根子） */
     int need_redraw;
     int quit;
 
@@ -424,6 +425,7 @@ static void draw_qrcode(void);
 static void draw_settings(void);
 static void show_loading(const char *text, int cancellable);
 static void loading_scr_restore(void);   /* 1.3.1：LOADING 态恢复到任务前界面 */
+static void loading_scr_enter(void);     /* 1.3.2：进入 LOADING 前记录真实来源界面 */
 static void show_message(const char *fmt, ...);
 static void open_history(void);
 static void act_account(void);
@@ -2066,7 +2068,13 @@ static int fetch_job(const char *path, const char *title, char *out_path, size_t
  * 子列表按返回时搬回去。搬 = 指针移交（不复制数据），O(1)。
  * 注意顺序：先 push 再 list_reset（reset 会释放 g.list）。 */
 static void list_push_parent(void) {
-    if (g.scr != SCR_LIST || g.list.v == NULL) { g.parent_valid = 0; return; }
+    if (g.scr != SCR_LIST || g.list.v == NULL) {
+        /* 1.3.2：被拒不压栈要留痕——真机 run.log 一眼定位层级断链 */
+        logmsg("nav: push 被拒 scr=%d list.v=%p（回答列表返回会直回主页）",
+               g.scr, (void *)g.list.v);
+        g.parent_valid = 0;
+        return;
+    }
     api_list_free(&g.parent_list);
     g.parent_list = g.list;
     memset(&g.list, 0, sizeof(g.list));   /* 所有权已移交，别让 reset 再释放一次 */
@@ -2077,6 +2085,8 @@ static void list_push_parent(void) {
     g.parent_top  = g.list_top;
     g.parent_page = g.list_page;
     g.parent_valid = 1;
+    logmsg("nav: 压栈 kind=%s n=%d sel=%d（返回键将回到这里）",
+           g.parent_kind, g.parent_list.n, g.parent_sel);
 }
 
 static int list_pop_parent(void) {
@@ -2130,22 +2140,23 @@ int ui_nav_stack_test(void) {
          g.list.v == NULL && g.list.n == 0 &&
          g.parent_sel == 1 && strcmp(g.parent_kind, "hot") == 0;
 
-    /* 1.3.1 回归钉子（真机实锤的层级返回失效根因）：
-     * run_job -> show_loading 把 scr 换成 LOADING 且成功路径不恢复，
-     * act_question 里的 push 就被 g.scr != SCR_LIST 守卫拒绝——
-     * 热榜快照没进栈，回答列表返回直接回主页。
-     * 现在恢复函数必须在 push 前把 scr 放回 LIST。 */
-    list_pop_parent();
-    g.scr_prev = SCR_LIST;
-    g.scr = SCR_LOADING;
+    /* 1.3.2 回归钉子（真机两次实锤：回答列表返回直接回主页）。
+     * 走真实链路而不是手动摆状态：热榜列表 → loading_scr_enter（进加载页，
+     * 记录来源）→ 任务成功 loading_scr_restore → scr 必须回到 LIST →
+     * push 必须成功。1.3.1 用 scr_prev 恢复是错的（它只在 show_message
+     * 时更新，没弹过消息时是过期值=主页），恢复完还是 LIST 之外的界面，
+     * 守卫照样拒绝压栈——自检又没拦住，这次必须用 enter/restore 本体。 */
+    list_pop_parent();           /* 取回第一次 push 的热榜数据，从头走真实链路 */
+    g.scr = SCR_LIST;            /* 此刻站在热榜列表上（g.list 有 2 条） */
+    g.scr_prev = SCR_HOME;       /* 没弹过消息：scr_prev 是过期值（历史坑） */
+    /* 先钉"LOADING 态直接 push 必须被拒"（防止有人删守卫） */
+    loading_scr_enter();
+    ok = ok && g.scr == SCR_LOADING && g.load_scr_prev == SCR_LIST;
+    list_push_parent();
+    ok = ok && g.parent_valid == 0 && g.list.n == 2;   /* 拒绝且不动 g.list */
+    /* 任务成功：恢复到来源界面，再压栈——必须成功 */
     loading_scr_restore();
     ok = ok && g.scr == SCR_LIST;
-    /* LOADING 态直接 push 必须被拒（防止有人顺手删掉守卫） */
-    g.scr = SCR_LOADING;
-    list_push_parent();
-    ok = ok && g.parent_valid == 0;
-    /* 复原到"已压栈"状态，让后续既有断言继续走 */
-    g.scr = SCR_LIST;
     list_push_parent();
     ok = ok && g.parent_valid == 1;
 
@@ -2203,7 +2214,7 @@ static void show_loading(const char *text, int cancellable) {
     snprintf(g.load_text, sizeof(g.load_text), "%s", text);
     g.load_start = now_ms_ui();
     g.load_cancellable = cancellable;
-    g.scr = SCR_LOADING;
+    loading_scr_enter();      /* 1.3.2：记录真实来源界面再换 LOADING */
     draw_loading();
 }
 
@@ -2213,10 +2224,23 @@ static void show_loading(const char *text, int cancellable) {
  * list_push_parent 的 g.scr != SCR_LIST 守卫拒绝压栈——热榜快照根本
  * 没进层级栈，返回键只能一路回主页。1.2.13 的层级返回在这条真实
  * 链路上从未生效（自检手动设了 scr，绕过了这条链，没拦住）。
- * 提取成函数供 [nav] 自检钉死。scr_prev 不会是 LOADING/MESSAGE
- * （show_message 明确跳过这两个），所以恢复目标总是真实界面。 */
+ * 提取成函数供 [nav] 自检钉死。
+ *
+ * 1.3.2 重要修正：恢复目标不能是 scr_prev——它只在 show_message 时才
+ * 更新，是"上一次弹消息前的界面"，对没弹过消息的会话来说是过期值
+ * （往往是主页）。真机实测：热榜 → 点问题 → 任务成功 → 恢复成主页 →
+ * 守卫照样拒绝压栈 → 返回还是直回主页。现在在进入加载页那一刻
+ * （loading_scr_enter）记录真实来源界面 load_scr_prev，恢复用它。 */
 static void loading_scr_restore(void) {
-    if (g.scr == SCR_LOADING) g.scr = g.scr_prev;
+    g.scr = g.load_scr_prev;
+}
+
+/* 进入加载页：记录真实来源界面再换状态。提取成函数（不画屏）供
+ * [nav] 自检走完整真实链路：enter → restore → push。 */
+static void loading_scr_enter(void) {
+    if (g.scr != SCR_LOADING && g.scr != SCR_MESSAGE)
+        g.load_scr_prev = g.scr;
+    g.scr = SCR_LOADING;
 }
 
 static void show_message(const char *fmt, ...) {

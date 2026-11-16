@@ -23,6 +23,8 @@
 
 **要求**：已越狱的 Kindle（推荐 Kindle Oasis 3，1264×1680；其他型号可自行按 `src/fb.h` 里的参数适配），已装 KUAL。
 
+> **1.3.2**：1.3.1 修「回答列表返回直接回主页」**没修干净**——恢复用的 `scr_prev` 是「上一次弹消息前的界面」（过期值，常为主页），守卫照样拒绝压栈。改为 `loading_scr_enter()` 在进加载页那一刻把真实来源界面记进 `load_scr_prev`，恢复用它；`[nav]` 自检重写为真实链路（enter→restore→push），`list_push_parent` 加日志（run.log 一眼定位层级断链）。详见[变更说明-1.3.2.md](变更说明-1.3.2.md)。
+
 > **1.3.1**：真机一修——**回答列表右下角返回直接回主页**。根因：`run_job`→`show_loading` 把 `g.scr` 换成加载页且成功后不恢复，导致 `act_question` 里 `list_push_parent()` 的 `g.scr != SCR_LIST` 守卫拒绝压栈，层级返回在真实链路上从未生效（自检手动设了 scr 绕过了这条链）。新增 `loading_scr_restore()` 统一在 `run_job` 成功后恢复界面状态，`[nav]` 自检补两条钉子。详见[变更说明-1.3.1.md](变更说明-1.3.1.md)。
 
 > **1.2.15**：真机两修。① **私信消息读取修复**：真机日志实锤会话项自带 url 是 web SSR 网页（149KB HTML）而非 API——新增 `js-initialData` 提取 + 通用递归收割消息；App 通道（api.zhihu.com）改 App UA + x-api-version、不发 web 签名；解析失败自动落盘 `msg_page_dump.html` 供下一轮诊断；② **翻页刷屏第 4 档**「局部 N 次 + 定期全刷」：平时不闪，每 N 页（config.txt `fullevery=`，默认 6）补一次全刷清残影，设置页四档循环。详见[变更说明-1.2.15.md](变更说明-1.2.15.md)。
