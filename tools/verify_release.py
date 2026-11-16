@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.15"
+VER = "1.3.0"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -370,6 +370,30 @@ def main():
           "ui.c 设置页四档循环 + fullevery 配置持久化")
     check("[dmssr]" in mnc and "social_parse_messages_html" in mnc,
           "main.c [dmssr] 离线自检：合成 SSR 页面钉死提取→收割链路")
+
+    # 1.3.0 专项：主界面刷屏四档 + 拼音输入法
+    check("(g_cfg.uifast + 1) % 4" in uic and "主界面刷屏" in uic and
+          "ui_fast_next = 1" in uic,
+          "ui.c 主界面刷屏四档（设置项/切换/屏内更新标记）")
+    check('if (g.fast_next && g_cfg.fast)' in uic and
+          'if (g.ui_fast_next)' in uic and "present_full" in uic,
+          "present_screen 三路分流：阅读页翻页/主界面屏内更新/换屏全刷")
+    check('strcmp(kt, "uifast") == 0' in uic and "uifast=%d" in uic,
+          "config.txt uifast 读写且不被手写项冲掉")
+    check("ime_table_n" in z.read(base + "source/src/ime_table.c").decode("utf-8", "replace"),
+          "ime_table.c 码表在包内（KOReader zh_pinyin_data 同源，Apache-2.0）")
+    check("ime_find" in z.read(base + "source/src/ime.c").decode("utf-8", "replace") and
+          "ime_segment" in z.read(base + "source/src/ime.c").decode("utf-8", "replace"),
+          "ime.c 码表二分查找 + 音节切分")
+    check("#include \"ime.h\"" in uic and "ime_refresh" in uic and "ime_commit" in uic and
+          "ime_bar_geom" in uic and "kb_cn" in uic,
+          "ui.c 候选栏绘制/热区/中英切换/数字选字接线")
+    check("[ime  ]" in mnc and "ime_segment(\"nihao\"" in mnc,
+          "main.c [ime] 离线自检：查找/切分/词组回退")
+    check('"ime"' in inc and "e->code = 990" in inc,
+          "模拟器注入命令 ime（离线回归输入法）")
+    check("fb_fill(&g.fb, cx + 2, ry + 2" in uic,
+          "确定键黑底用 fb_fill 填充（fb_rect 只画边框，旧版白底白字修复）")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

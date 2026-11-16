@@ -18,6 +18,7 @@
 #include "png.h"
 #include "qr.h"
 #include "social.h"
+#include "ime.h"
 #include "statusbar.h"
 #include "ui.h"
 #include "json.h"
@@ -385,6 +386,30 @@ static int run_selftest(void) {
         printf("[dmssr2] %s 无 initialData 时失败\n", ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
         msg_list_free(&ml);
+    }
+
+    /* 1.3.0：拼音输入法（KOReader 同源码表）：查找/切分/候选 */
+    {
+        const ImeEntry *e = ime_find("ba");
+        char cs[40][16];
+        int n = e ? ime_split_cands(e->cands, cs, 40) : 0;
+        ok = e && n >= 5 && strcmp(cs[0], "吧") == 0;
+        printf("[ime  ] %s 码表查找 ba n=%d 首候选=%s\n", ok ? "OK" : "FAIL", n,
+               n ? cs[0] : "-");
+        ok ? pass++ : fail++;
+
+        char segs[8][8];
+        int ns = ime_segment("nihao", segs, 8);
+        ok = ns == 2 && strcmp(segs[0], "ni") == 0 && strcmp(segs[1], "hao") == 0;
+        printf("[ime  ] %s 音节切分 nihao=%d\n", ok ? "OK" : "FAIL", ns);
+        ok ? pass++ : fail++;
+
+        e = ime_find("nihao");          /* 词组整键不存在 */
+        int has_hao = ime_find("hao") != NULL;
+        ok = e == NULL && has_hao && ime_segment("nihao", segs, 8) == 2;
+        printf("[ime  ] %s 词组回退路径（nihao 无键、末音节 hao 可查）\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
     }
 
     /* 字体缓存压力：长时间阅读后不能出现随机缺字 */

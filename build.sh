@@ -69,7 +69,7 @@ EOF
 
 SRC="src/main.c src/ui.c src/api.c src/net.c src/json.c src/common.c src/md5.c src/zse96.c \
      src/content.c src/fb.c src/png.c src/img.c src/font.c src/input.c src/layout.c \
-     src/account.c src/social.c src/qr.c src/qrcodegen.c src/statusbar.c"
+     src/account.c src/ime.c src/ime_table.c src/social.c src/qr.c src/qrcodegen.c src/statusbar.c"
 
 build_arm() {
     build_deps

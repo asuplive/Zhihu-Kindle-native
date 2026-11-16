@@ -15,6 +15,7 @@
 #include "font.h"
 #include "img.h"
 #include "input.h"
+#include "ime.h"
 #include "json.h"
 #include "layout.h"
 #include "net.h"
@@ -58,9 +59,13 @@ typedef struct {
     int liststyle;
     /* 1.2.15：第 4 档翻页刷屏「局部 N 次 + 一次全刷」的周期 N（2..20，默认 6） */
     int fullevery;
+    /* 1.3.0：主界面刷屏（首页/列表/设置的屏内更新——选中移动、列表翻页）。
+     * 四档与 fast 完全一致；阅读页翻页继续用 fast，两套互不干扰。
+     * 换屏（首页→列表、打开文章）永远全刷，否则会叠屏。 */
+    int uifast;
 } Config;
 
-static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1, 6 };
+static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1, 6, 1 };
 
 static void config_load(void) {
     char path[320];
@@ -85,6 +90,7 @@ static void config_load(void) {
             else if (strcmp(k, "rec") == 0) g_cfg.rec = iv;
             else if (strcmp(k, "liststyle") == 0) g_cfg.liststyle = iv;
             else if (strcmp(k, "fullevery") == 0) g_cfg.fullevery = iv;
+            else if (strcmp(k, "uifast") == 0) g_cfg.uifast = iv;
             else if (strcmp(k, "refresh") == 0)
                 snprintf(g_cfg.refresh, sizeof(g_cfg.refresh), "%s", v);
         }
@@ -101,6 +107,8 @@ static void config_load(void) {
      * 非法值回到 1 */
     if (g_cfg.fast < 0 || g_cfg.fast > 3) g_cfg.fast = 1;
     if (g_cfg.fullevery < 2 || g_cfg.fullevery > 20) g_cfg.fullevery = 6;
+    /* 1.3.0：主界面刷屏同四档，非法值回 1（局部） */
+    if (g_cfg.uifast < 0 || g_cfg.uifast > 3) g_cfg.uifast = 1;
     /* 推荐条数只认 6/12/18 */
     if (g_cfg.rec != 6 && g_cfg.rec != 12 && g_cfg.rec != 18) g_cfg.rec = 6;
     g_cfg.showbar = g_cfg.showbar ? 1 : 0;
@@ -138,7 +146,7 @@ static void config_save(void) {
                                   strcmp(kt, "rotate") == 0 || strcmp(kt, "images") == 0 ||
                                   strcmp(kt, "margin") == 0 || strcmp(kt, "showbar") == 0 ||
                                   strcmp(kt, "rec") == 0 || strcmp(kt, "liststyle") == 0 ||
-                                  strcmp(kt, "fullevery") == 0;
+                                  strcmp(kt, "fullevery") == 0 || strcmp(kt, "uifast") == 0;
                     if (!managed) buf_printf(&keep, "%s\n", line);
                 }
                 if (!nl) break;
@@ -151,9 +159,9 @@ static void config_save(void) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
                      "size=%d\nfast=%d\nrotate=%d\nimages=%d\nmargin=%d\nshowbar=%d\nrec=%d\n"
-                     "liststyle=%d\nfullevery=%d\n",
+                     "liststyle=%d\nfullevery=%d\nuifast=%d\n",
                      g_cfg.size, g_cfg.fast, g_cfg.rotate, g_cfg.images, g_cfg.margin_pct,
-                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle, g_cfg.fullevery);
+                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle, g_cfg.fullevery, g_cfg.uifast);
     if (n > 0 && (size_t)n < sizeof(buf) && keep.len)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s", buf_cstr(&keep));
     if (n < 0) n = 0;
@@ -327,6 +335,12 @@ typedef struct {
     char input_title[96];
     int  input_kind;
     int  kb_shift;
+    /* 1.3.0：拼音输入法状态（KOReader 同源码表，见 ime.c） */
+    int  kb_cn;                 /* 1=中文拼音（默认） 0=英文直打 */
+    char ime_py[24];            /* 正在组合的拼音 */
+    char ime_cands[40][16];     /* 候选字/词 */
+    int  ime_n;                 /* 候选总数 */
+    int  ime_page;              /* 候选页（0 起，每页 IME_PER_PAGE 个） */
 
     /* 消息 */
     char msg[512];
@@ -371,6 +385,9 @@ typedef struct {
     /* 1.2.8：只让"翻一页"走局部刷新。换屏（首页↔列表↔阅读↔设置…）
      * 一律全刷，否则上一屏的字会留在纸上（真机照片里的"重叠"）。 */
     int        fast_next;
+    /* 1.3.0：主界面屏内更新（选中移动/列表翻页）标记——present_screen
+     * 据此走「主界面刷屏」档位而不是全刷。换屏路径不许设它。 */
+    int        ui_fast_next;
     /* 三档图片模式的当前档位快照（0 无图 / 1 点按加载 / 2 自动异步） */
     int        img_mode;
 } App;
@@ -565,11 +582,28 @@ static void present_fast(void) {
  * "这一屏只是翻一页"（g.fast_next）才允许走局部更新。 */
 static void present_screen(void) {
     if (g.fast_next && g_cfg.fast) {
+        /* 阅读页翻页：跟随「翻页刷屏」四档（fast_mode 在 fb_present 里
+         * 决定波形，第 4 档的周期性全刷也在里面记账） */
         g.fast_next = 0;
+        g.fb.fast_mode = g_cfg.fast;
+        present_fast();
+        return;
+    }
+    if (g.ui_fast_next) {
+        /* 1.3.0：主界面屏内更新（选中移动/列表翻页）：跟随「主界面刷屏」四档。
+         * 第 4 档与阅读页共用 fullevery 周期和 fb 的翻页计数。 */
+        g.ui_fast_next = 0;
+        if (g_cfg.uifast == 0) {
+            g.fast_next = 0;
+            present_full();
+            return;
+        }
+        g.fb.fast_mode = g_cfg.uifast;
         present_fast();
         return;
     }
     g.fast_next = 0;
+    g.ui_fast_next = 0;
     present_full();
 }
 
@@ -581,7 +615,7 @@ static const char *HOME_ITEMS[] = {
 };
 static const char *HOME_DESC[] = {
     "实时热榜 · 50 条", "个性化推荐流（需登录）", "私信会话（需登录）", "扫码登录 / 导入 Cookie",
-    "输入关键词搜索", "收藏夹（需登录）", "最近读过的内容", "字号 / 刷新 / 旋转",
+    "输入关键词搜索（拼音）", "收藏夹（需登录）", "最近读过的内容", "字号 / 刷新 / 旋转",
     "版本与设备信息", "返回 Kindle 系统",
 };
 #define HOME_COUNT ((int)(sizeof(HOME_ITEMS) / sizeof(HOME_ITEMS[0])))
@@ -1152,10 +1186,10 @@ static void draw_settings(void) {
     draw_header("设置", NULL);
 
     static const char *names[] = {
-        "正文字号", "翻页刷屏", "界面旋转", "显示图片", "页边距",
+        "正文字号", "翻页刷屏", "主界面刷屏", "界面旋转", "显示图片", "页边距",
         "推荐条数", "列表样式", "系统状态栏", "重新排版", "清空缓存", "返回首页",
     };
-    char vals[11][64];
+    char vals[12][64];
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.size == 0 ? "小" : (g_cfg.size == 1 ? "中" : "大"));
     /* 1.2.8：fast 不再等于"用 DU 波形"（那是残影和字发虚的根），
      * 而是"翻页要不要整屏闪一下"。默认不闪（局部 + GC16），画面本身是干净的。
@@ -1166,23 +1200,28 @@ static void draw_settings(void) {
              g_cfg.fast == 2 ? "Regal（不闪+补偿）" :
              g_cfg.fast == 3 ? "局部+定期全刷" :
              (g_cfg.fast ? "局部刷新（不闪）" : "全部刷新（每页闪）"));
-    snprintf(vals[2], sizeof(vals[2]), "%d°", g_cfg.rotate * 90);
+    /* 1.3.0：主界面刷屏四档，语义与翻页刷屏一致，管首页/列表/设置的屏内更新 */
+    snprintf(vals[2], sizeof(vals[2]), "%s",
+             g_cfg.uifast == 2 ? "Regal（不闪+补偿）" :
+             g_cfg.uifast == 3 ? "局部+定期全刷" :
+             (g_cfg.uifast ? "局部刷新（不闪）" : "全部刷新（每步闪）"));
+    snprintf(vals[3], sizeof(vals[3]), "%d°", g_cfg.rotate * 90);
     static const char *imgmodes[] = { "关闭", "点按加载", "自动加载" };
     if (g_cfg.images < 0 || g_cfg.images > 2) g_cfg.images = 0;
-    snprintf(vals[3], sizeof(vals[3]), "%s", imgmodes[g_cfg.images]);
-    snprintf(vals[4], sizeof(vals[4]), "%d%%", g_cfg.margin_pct);
-    snprintf(vals[5], sizeof(vals[5]), "%d 条", g_cfg.rec);
+    snprintf(vals[4], sizeof(vals[4]), "%s", imgmodes[g_cfg.images]);
+    snprintf(vals[5], sizeof(vals[5]), "%d%%", g_cfg.margin_pct);
+    snprintf(vals[6], sizeof(vals[6]), "%d 条", g_cfg.rec);
     /* 1.2.12：推荐/回答列表两种布局 */
-    snprintf(vals[6], sizeof(vals[6]), "%s",
+    snprintf(vals[7], sizeof(vals[7]), "%s",
              g_cfg.liststyle ? "详细（标题+摘要）" : "简洁（标题行高小）");
-    snprintf(vals[7], sizeof(vals[7]), "%s", g_cfg.showbar ? "显示" : "隐藏（推荐）");
-    snprintf(vals[8], sizeof(vals[8]), "重新分页");
-    snprintf(vals[9], sizeof(vals[9]), "含图片缓存");
-    vals[10][0] = 0;
+    snprintf(vals[8], sizeof(vals[8]), "%s", g_cfg.showbar ? "显示" : "隐藏（推荐）");
+    snprintf(vals[9], sizeof(vals[9]), "重新分页");
+    snprintf(vals[10], sizeof(vals[10]), "含图片缓存");
+    vals[11][0] = 0;
 
     int rh = set_row_h();
     int y = g.header_h;
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 12; i++) {
         if (i == g.list_sel) {
             fb_fill(&g.fb, 0, y, g.W, rh, 0);
         }
@@ -1362,6 +1401,79 @@ static const char *KB_ROWS[] = {
     "zxcvbnm",
 };
 
+/* ---------------- 1.3.0：拼音输入法（KOReader 同源码表） ---------------- */
+
+#define IME_PER_PAGE 8
+#define IME_MAX_CAND 40
+
+/* 候选栏几何：draw_input 与 handle_tap 共用，两处必须算得一致 */
+static void ime_bar_geom(int *bar_y, int *py_w, int *slot_x0, int *slot_w,
+                         int *page_x, int *page_w) {
+    *bar_y = g.H - g.footer_h - (g.base * 11 / 5) * 5 - g.base * 2 - g.base / 2;
+    int pyw = font_width(g.base * 3 / 4, g.ime_py, (int)strlen(g.ime_py));
+    *py_w = pyw;
+    *page_w = g.base * 3;
+    *page_x = g.W - g.margin - *page_w;
+    *slot_x0 = g.margin + pyw + g.base / 2;
+    *slot_w = (*page_x - *slot_x0) / IME_PER_PAGE;
+    if (*slot_w < g.base) *slot_w = g.base;
+}
+
+static void ime_reset(void) {
+    g.ime_py[0] = 0;
+    g.ime_n = 0;
+    g.ime_page = 0;
+}
+
+static void ime_add_cands(const char *cands) {
+    char tmp[IME_PER_PAGE * 2][16];
+    int n = ime_split_cands(cands, tmp, IME_PER_PAGE * 2);
+    for (int i = 0; i < n && g.ime_n < IME_MAX_CAND; i++) {
+        int dup = 0;
+        for (int j = 0; j < g.ime_n; j++)
+            if (strcmp(g.ime_cands[j], tmp[i]) == 0) { dup = 1; break; }
+        if (!dup) snprintf(g.ime_cands[g.ime_n++], sizeof(g.ime_cands[0]), "%s", tmp[i]);
+    }
+}
+
+/* 按当前拼音串重算候选：精确键 → 词组切分兜底（末音节） → 音节前缀收集 */
+static void ime_refresh(void) {
+    g.ime_n = 0;
+    g.ime_page = 0;
+    if (!g.ime_py[0]) return;
+    const ImeEntry *e = ime_find(g.ime_py);
+    if (e) { ime_add_cands(e->cands); return; }
+    char segs[8][8];
+    int ns = ime_segment(g.ime_py, segs, 8);
+    if (ns > 0) {
+        /* 整串没中（如 nihao 不在码表）：正在打的下一个字大概率按末音节读音 */
+        e = ime_find(segs[ns - 1]);
+        if (e) ime_add_cands(e->cands);
+        return;
+    }
+    /* 没切完（打了一半）：收集以当前串开头的合法音节键的候选 */
+    size_t pl = strlen(g.ime_py);
+    for (int i = 0; i < ime_table_n && g.ime_n < IME_MAX_CAND; i++) {
+        const char *k = ime_table[i].py;
+        if (strncmp(k, g.ime_py, pl) == 0 &&
+            ime_is_syllable(k, (int)strlen(k)))
+            ime_add_cands(ime_table[i].cands);
+    }
+}
+
+/* 候选上屏并清空拼音 */
+static void ime_commit(int idx) {
+    if (idx < 0 || idx >= g.ime_n) return;
+    const char *wd = g.ime_cands[idx];
+    int wl = (int)strlen(wd);
+    if (g.input_len + wl < (int)sizeof(g.input) - 1) {
+        memcpy(g.input + g.input_len, wd, (size_t)wl);
+        g.input_len += wl;
+        g.input[g.input_len] = 0;
+    }
+    ime_reset();
+}
+
 static void draw_input(void) {
     fb_clear(&g.fb, 255);
     draw_header(g.input_title, NULL);
@@ -1380,6 +1492,41 @@ static void draw_input(void) {
     int cols = 10;
     int key_w = (g.W - 2 * g.margin) / cols;
 
+    /* 1.3.0：候选栏（中文拼音模式且正在组合拼音时出现） */
+    int bar_h = 0;
+    if (g.kb_cn && g.ime_py[0]) {
+        int bpy, sx0, sw, pgx, pgw, by;
+        ime_bar_geom(&by, &bpy, &sx0, &sw, &pgx, &pgw);
+        bar_h = g.base * 2;
+        /* 拼音串（灰） */
+        text_at(g.margin, by + bar_h / 2 + g.base / 4, g.base * 3 / 4,
+                g.ime_py, 110, 0);
+        /* 候选槽：每槽序号（小、灰）+ 候选词（黑） */
+        int cpx = g.base * 3 / 5;
+        int start = g.ime_page * IME_PER_PAGE;
+        for (int i = 0; i < IME_PER_PAGE; i++) {
+            int idx = start + i;
+            if (idx >= g.ime_n) break;
+            int sx = sx0 + i * sw;
+            fb_rect(&g.fb, sx + 1, by + 1, sw - 2, bar_h - 2, 235);
+            char num[2] = { (char)('1' + i), 0 };
+            text_at(sx + g.base / 5, by + g.base / 2, g.base / 2, num, 130, 0);
+            const char *wd = g.ime_cands[idx];
+            int tw = font_width(cpx, wd, (int)strlen(wd));
+            text_at(sx + (sw - tw) / 2, by + bar_h - g.base / 4, cpx, wd, 0, 0);
+        }
+        /* 翻页键 ‹ › */
+        fb_rect(&g.fb, pgx + 1, by + 1, pgw / 2 - 2, bar_h - 2,
+                g.ime_page > 0 ? 120 : 240);
+        fb_rect(&g.fb, pgx + pgw / 2 + 1, by + 1, pgw / 2 - 2, bar_h - 2,
+                (g.ime_page + 1) * IME_PER_PAGE < g.ime_n ? 120 : 240);
+        text_at(pgx + pgw / 4 - g.base / 3, by + bar_h / 2 + g.base / 4,
+                g.base * 3 / 4, "‹", g.ime_page > 0 ? 0 : 170, 0);
+        text_at(pgx + pgw * 3 / 4 - g.base / 3, by + bar_h / 2 + g.base / 4,
+                g.base * 3 / 4, "›",
+                (g.ime_page + 1) * IME_PER_PAGE < g.ime_n ? 0 : 170, 0);
+    }
+
     for (int r = 0; r < 4; r++) {
         const char *row = KB_ROWS[r];
         int len = (int)strlen(row);
@@ -1395,19 +1542,24 @@ static void draw_input(void) {
         }
     }
 
-    /* 第 5 行：空格 / 退格 / 确定 / 取消 */
+    /* 第 5 行：中/英切换 / 空格 / 退格 / 确定 / 取消 */
     int ry = kb_top + 4 * key_h;
-    const char *labels[4] = { "空格", "退格", "确定", "取消" };
-    int widths[4] = { 4, 2, 2, 2 };
+    const char *labels[5] = { g.kb_cn ? "中文" : "英文", "空格", "退格", "确定", "取消" };
+    int widths5[5] = { 2, 2, 2, 2, 2 };
     int cx = g.margin;
     int total_units = 10;
-    for (int i = 0; i < 4; i++) {
-        int w2 = (g.W - 2 * g.margin) * widths[i] / total_units;
-        fb_rect(&g.fb, cx + 2, ry + 2, w2 - 4, key_h - 4, i == 2 ? 0 : 120);
+    for (int i = 0; i < 5; i++) {
+        int w2 = (g.W - 2 * g.margin) * widths5[i] / total_units;
+        /* 1.3.0：确定键要黑底白字——fb_rect 只画边框不填充，旧版
+         * 「确定」一直是白底白字（看不见），必须用 fb_fill 填充。 */
+        if (i == 3)
+            fb_fill(&g.fb, cx + 2, ry + 2, w2 - 4, key_h - 4, 0);
+        else
+            fb_rect(&g.fb, cx + 2, ry + 2, w2 - 4, key_h - 4, 120);
         int cpx = g.base * 3 / 4;
         int tw = font_width(cpx, labels[i], (int)strlen(labels[i]));
         text_at(cx + (w2 - tw) / 2, ry + key_h / 2 + cpx / 3, cpx, labels[i],
-                i == 2 ? 255 : 0, 0);
+                i == 3 ? 255 : 0, 0);
         cx += w2;
     }
 
@@ -2681,7 +2833,7 @@ static void act_search(const char *q) {
     int rc = api_parse_feed(body, n, &g.list);
     free(body);
     if (rc != 0) { show_message("%s", api_error()); return; }
-    if (g.list.n == 0) list_set_empty_msg("没有搜到结果。换个关键词试试（输入框支持英文/数字）。");
+    if (g.list.n == 0) list_set_empty_msg("没有搜到结果。换个关键词试试（支持中文拼音、英文、数字）。");
     g.scr = SCR_LIST;
     draw_list();
 }
@@ -3091,6 +3243,8 @@ static void input_start(const char *title, int kind, const char *initial) {
     g.input_kind = kind;
     snprintf(g.input, sizeof(g.input), "%s", initial ? initial : "");
     g.input_len = (int)strlen(g.input);
+    g.kb_cn = 1;          /* 1.3.0：默认中文拼音（KOReader 同源码表） */
+    ime_reset();
     g.scr = SCR_INPUT;
     draw_input();
 }
@@ -3159,6 +3313,7 @@ static void list_page(int step) {
      * "保持选中项可见"的规则会把页首拉回上一页末尾（翻页后首行是第 2 条）。 */
     g.list_top = page * per;
     if (g.list_sel >= g.list.n) g.list_sel = g.list.n > 0 ? g.list.n - 1 : 0;
+    g.ui_fast_next = 1;   /* 1.3.0：列表翻页走「主界面刷屏」档 */
     draw_list();
 }
 
@@ -3199,7 +3354,7 @@ static void handle_tap(int x, int y) {
                         case 1: act_recommend(); break;
                         case 2: act_dm(); break;
                         case 3: act_account(); break;
-                        case 4: input_start("搜索（英文/数字）", 1, ""); break;
+                        case 4: input_start("搜索", 1, ""); break;
                         case 5: act_collections(); break;
                         case 6: open_history(); break;
                         case 7: g.scr = SCR_SETTINGS; g.list_sel = 0; draw_settings(); break;
@@ -3279,6 +3434,25 @@ static void handle_tap(int x, int y) {
                                  "残影会慢慢攒起来，介意的话换\n「局部+定期全刷」或「Regal」。");
                 return;
             } else if (i == 2) {
+                /* 1.3.0：主界面刷屏四档——管首页/列表/设置的屏内更新
+                 * （选中移动、列表翻页）。阅读页翻页仍走「翻页刷屏」，
+                 * 两套互不影响；换屏永远全刷，不会叠屏。 */
+                g_cfg.uifast = (g_cfg.uifast + 1) % 4;
+                config_save();
+                if (g_cfg.uifast == 2)
+                    show_message("主界面刷屏：Regal（不闪+补偿）。\n\nRegal 是 Kindle 的残影补偿波形。\n\n"
+                                 "驱动不认会自动退回局部刷新并写日志。");
+                else if (g_cfg.uifast == 3)
+                    show_message("主界面刷屏：局部 + 定期全刷。\n\n平时不闪，每 %d 步补一次全刷清残影。\n\n"
+                                 "周期与「翻页刷屏」共用 config.txt 的\nfullevery=N（2..20，默认 6）。",
+                                 g_cfg.fullevery);
+                else if (g_cfg.uifast == 0)
+                    show_message("主界面刷屏：全部刷新。\n\n每一步操作整屏闪一下，最干净但稍慢。");
+                else
+                    show_message("主界面刷屏：局部刷新。\n\n选中移动、列表翻页不闪屏、最快。\n\n"
+                                 "残影会慢慢攒起来，介意的话换\n「局部+定期全刷」或「Regal」。");
+                return;
+            } else if (i == 3) {
                 g_cfg.rotate = (g_cfg.rotate + 1) % 4;
                 fb_set_rotate(&g.fb, g_cfg.rotate);
                 /* 关键：显示转了，触摸必须跟着转。
@@ -3290,7 +3464,7 @@ static void handle_tap(int x, int y) {
                 logmsg("设置: 旋转 %d°（触摸同步，物理 %dx%d）",
                        g_cfg.rotate * 90, g.fb.width, g.fb.height);
                 config_save();
-            } else if (i == 3) {
+            } else if (i == 4) {
                 g_cfg.images = (g_cfg.images + 1) % 3;
                 g.img_mode = g_cfg.images;
                 config_save();
@@ -3308,16 +3482,16 @@ static void handle_tap(int x, int y) {
                     show_message("图片：自动加载。\n\n正文先出来，图片在后台从"
                                  "第一张开始逐张下，\n补上就自动替换占位（只刷当前页）。");
                 return;
-            } else if (i == 4) {
+            } else if (i == 5) {
                 g_cfg.margin_pct = g_cfg.margin_pct >= 10 ? 4 : g_cfg.margin_pct + 3;
                 g.margin = g.W * g_cfg.margin_pct / 100;
                 config_save();
                 if (g.doc.n) reader_layout();
-            } else if (i == 5) {
+            } else if (i == 6) {
                 /* 推荐条数：6 → 12 → 18 → 6 */
                 g_cfg.rec = (g_cfg.rec == 6) ? 12 : (g_cfg.rec == 12 ? 18 : 6);
                 config_save();
-            } else if (i == 6) {
+            } else if (i == 7) {
                 /* 1.2.12：列表样式 简洁 <-> 详细，即时生效（下次画列表就用） */
                 g_cfg.liststyle = g_cfg.liststyle ? 0 : 1;
                 config_save();
@@ -3326,7 +3500,7 @@ static void handle_tap(int x, int y) {
                 else
                     show_message("列表样式：简洁。\n\n每条只显示问题标题 + 作者赞同。\n行高小、条目密，适合快速划。");
                 return;
-            } else if (i == 7) {
+            } else if (i == 8) {
                 /* 1.2.14：状态栏隐藏换成正面方案——禁 chrome pillow +
                  * SIGSTOP awesome（KOReader 真机验证多年的同款方法），
                  * 全程不碰 cvm，无 framework 看门狗风险，且即时生效。
@@ -3344,9 +3518,9 @@ static void handle_tap(int x, int y) {
                                  "（时间/网络/电量）回来了。");
                 }
                 return;
-            } else if (i == 8) {
-                if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
             } else if (i == 9) {
+                if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
+            } else if (i == 10) {
                 long n = api_cache_clear();
                 show_message("已删除 %ld 个缓存文件\n（含图片缓存，全部文章的都清掉了）", n);
                 return;
@@ -3420,12 +3594,43 @@ static void handle_tap(int x, int y) {
             break;
         }
         case SCR_INPUT: {
-            /* 交给键盘处理 */
+            /* 交给键盘处理（1.3.0：含中文拼音候选栏） */
             int kb_top = g.H - g.footer_h - (g.base * 11 / 5) * 5;
             if (kb_top < g.header_h + g.base * 3) kb_top = g.header_h + g.base * 3;
             int key_h = (g.H - g.footer_h - kb_top) / 5;
             int cols = 10;
             int key_w = (g.W - 2 * g.margin) / cols;
+
+            /* 候选栏：拼音区 / 候选槽 / 翻页键 */
+            if (g.kb_cn && g.ime_py[0]) {
+                int by, pyw, sx0, sw, pgx, pgw;
+                ime_bar_geom(&by, &pyw, &sx0, &sw, &pgx, &pgw);
+                int bar_h = g.base * 2;
+                if (y >= by && y < by + bar_h) {
+                    if (x >= pgx && x < pgx + pgw / 2) {
+                        if (g.ime_page > 0) { g.ime_page--; draw_input(); }
+                        return;
+                    }
+                    if (x >= pgx + pgw / 2 && x <= pgx + pgw) {
+                        if ((g.ime_page + 1) * IME_PER_PAGE < g.ime_n) {
+                            g.ime_page++;
+                            draw_input();
+                        }
+                        return;
+                    }
+                    if (x >= sx0 && x < pgx) {
+                        int si = (x - sx0) / sw;
+                        int idx = g.ime_page * IME_PER_PAGE + si;
+                        if (si >= 0 && si < IME_PER_PAGE && idx < g.ime_n) {
+                            ime_commit(idx);
+                            draw_input();
+                        }
+                        return;
+                    }
+                    return;   /* 点拼音串本身：不动 */
+                }
+            }
+
             int r = (y - kb_top) / key_h;
             if (r >= 0 && r < 4) {
                 const char *row = KB_ROWS[r];
@@ -3434,37 +3639,79 @@ static void handle_tap(int x, int y) {
                 int c = (x - base_x) / key_w;
                 if (c >= 0 && c < len) {
                     char ch = row[c];
-                    if (ch >= 'a' && ch <= 'z' && g.kb_shift) ch = (char)(ch - 32);
-                    if (g.input_len < (int)sizeof(g.input) - 2) {
-                        g.input[g.input_len++] = ch;
-                        g.input[g.input_len] = 0;
+                    if (ch >= 'a' && ch <= 'z') {
+                        if (g.kb_cn) {
+                            /* 拼音组合：小写、只收字母，最长 20 */
+                            size_t pl = strlen(g.ime_py);
+                            if (pl < sizeof(g.ime_py) - 1) {
+                                g.ime_py[pl] = ch;
+                                g.ime_py[pl + 1] = 0;
+                                ime_refresh();
+                            }
+                            draw_input();
+                            return;
+                        }
+                        if (g.kb_shift) ch = (char)(ch - 32);
                     }
-                    draw_input();
+                    if (!g.kb_cn || !g.ime_n || ch < '1' || ch > '8') {
+                        /* 英文直打；或中文模式无候选/按了 9 0 */
+                        if (g.input_len < (int)sizeof(g.input) - 2) {
+                            g.input[g.input_len++] = ch;
+                            g.input[g.input_len] = 0;
+                        }
+                        draw_input();
+                        return;
+                    }
+                    /* 中文模式：数字 1-8 选当前页候选 */
+                    int idx = g.ime_page * IME_PER_PAGE + (ch - '1');
+                    if (idx < g.ime_n) { ime_commit(idx); draw_input(); }
+                    else {
+                        if (g.input_len < (int)sizeof(g.input) - 2) {
+                            g.input[g.input_len++] = ch;
+                            g.input[g.input_len] = 0;
+                        }
+                        draw_input();
+                    }
+                    return;
                 }
                 return;
             }
             if (r == 4) {
                 int cx = g.margin;
-                int widths[4] = { 4, 2, 2, 2 };
-                for (int i = 0; i < 4; i++) {
-                    int w2 = (g.W - 2 * g.margin) * widths[i] / 10;
+                int widths5[5] = { 2, 2, 2, 2, 2 };
+                for (int i = 0; i < 5; i++) {
+                    int w2 = (g.W - 2 * g.margin) * widths5[i] / 10;
                     if (x >= cx && x < cx + w2) {
                         if (i == 0) {
-                            if (g.input_len < (int)sizeof(g.input) - 2) {
-                                g.input[g.input_len++] = ' ';
-                                g.input[g.input_len] = 0;
-                            }
+                            /* 中/英切换：切走时丢掉未上屏的拼音 */
+                            g.kb_cn = g.kb_cn ? 0 : 1;
+                            ime_reset();
                             draw_input();
                         } else if (i == 1) {
-                            if (g.input_len > 0) {
+                            /* 空格：中文有候选=上屏第一个；否则空格 */
+                            if (g.kb_cn && g.ime_n > 0) {
+                                ime_commit(g.ime_page * IME_PER_PAGE);
+                                draw_input();
+                            } else if (g.input_len < (int)sizeof(g.input) - 2) {
+                                g.input[g.input_len++] = ' ';
+                                g.input[g.input_len] = 0;
+                                draw_input();
+                            }
+                        } else if (i == 2) {
+                            /* 退格：先删拼音，再删已上屏内容 */
+                            if (g.kb_cn && g.ime_py[0]) {
+                                g.ime_py[strlen(g.ime_py) - 1] = 0;
+                                ime_refresh();
+                                draw_input();
+                            } else if (g.input_len > 0) {
                                 /* 删一个 UTF-8 字符 */
                                 int k = g.input_len - 1;
                                 while (k > 0 && ((unsigned char)g.input[k] & 0xC0) == 0x80) k--;
                                 g.input_len = k;
                                 g.input[k] = 0;
+                                draw_input();
                             }
-                            draw_input();
-                        } else if (i == 2) {
+                        } else if (i == 3) {
                             g.scr = SCR_HOME;
                             act_search(g.input);
                         } else {
@@ -3684,6 +3931,13 @@ static void sim_answers_demo(void) {
 
 static void handle_key(int code) {
     if (code == 997) { sim_demo_open(); return; }
+    if (code == 990) {   /* 1.3.0：拼音输入法演示（离线） */
+        input_start("搜索", 1, "");
+        snprintf(g.ime_py, sizeof(g.ime_py), "nihao");
+        ime_refresh();
+        draw_input();
+        return;
+    }
     if (code == 993) { sim_empty_demo(); return; }
     if (code == 996) { sim_qr_demo(); return; }
     if (code == 995) { sim_dm_list_demo(); return; }
@@ -3722,8 +3976,8 @@ static void handle_key(int code) {
             break;
         case SCR_LIST:
             if (code == 158 || code == 102) nav_back();   /* 1.2.13：返回上一项 */
-            else if (code == 103 || code == 105 || code == 104) { if (g.list_sel > 0) { g.list_sel--; draw_list(); } }
-            else if (code == 108 || code == 106 || code == 109) { if (g.list_sel + 1 < g.list.n) { g.list_sel++; draw_list(); } }
+            else if (code == 103 || code == 105 || code == 104) { if (g.list_sel > 0) { g.list_sel--; g.ui_fast_next = 1; draw_list(); } }
+            else if (code == 108 || code == 106 || code == 109) { if (g.list_sel + 1 < g.list.n) { g.list_sel++; g.ui_fast_next = 1; draw_list(); } }
             else if (code == 28 || code == 96) {
                 if (g.list_sel < g.list.n) {
                     if (strcmp(g.list_kind, "collections") == 0) {
@@ -3736,8 +3990,8 @@ static void handle_key(int code) {
             }
             break;
         case SCR_HOME:
-            if (code == 108 || code == 106) { g.list_sel = (g.list_sel + 1) % HOME_COUNT; draw_home(); }
-            else if (code == 103 || code == 105) { g.list_sel = (g.list_sel + HOME_COUNT - 1) % HOME_COUNT; draw_home(); }
+            if (code == 108 || code == 106) { g.list_sel = (g.list_sel + 1) % HOME_COUNT; g.ui_fast_next = 1; draw_home(); }
+            else if (code == 103 || code == 105) { g.list_sel = (g.list_sel + HOME_COUNT - 1) % HOME_COUNT; g.ui_fast_next = 1; draw_home(); }
             else if (code == 28 || code == 96)
                 handle_tap(g.W / 2, home_top() + home_row_h() * g.list_sel + 1);
             else if (code == 158) g.quit = 1;
