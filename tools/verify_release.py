@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.2.14"
+VER = "1.2.15"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -345,6 +345,31 @@ def main():
     check('"anslist"' in z.read(base + "source/src/input.c").decode("utf-8", "replace") and
           "sim_answers_demo" in uic,
           "模拟器离线注入回答列表（知乎游客 403，回归需要离线数据）")
+
+    # 1.2.15：私信消息 SSR 收割 + 翻页刷屏第 4 档（局部 N 次 + 定期全刷）
+    soc = z.read(base + "source/src/social.c").decode("utf-8", "replace")
+    check("js-initialData" in soc and "social_parse_messages_html" in soc and
+          "harvest_walk" in soc and "looks_like_message" in soc,
+          "social.c SSR 收割：提取 js-initialData + 通用递归找消息数组（真机实锤会话 url 是网页）")
+    check("msg_page_dump.html" in soc,
+          "social.c 解析失败时把 SSR 页面落盘（下一轮反馈不再猜结构）")
+    check('"https://www.zhihu.com/messages?thread_id={id}"' in soc,
+          "social.c 消息候选加 web SSR 页面兜底")
+    check("is_sender" in soc and "from_self" in soc,
+          "social.c is_self 判定覆盖 is_sender/from_self（App/SSR 字段）")
+    check("api.zhihu.com" in z.read(base + "source/src/api.c").decode("utf-8", "replace") and
+          "x-api-version" in z.read(base + "source/src/api.c").decode("utf-8", "replace") and
+          "UA_APP" in z.read(base + "source/src/api.c").decode("utf-8", "replace"),
+          "api.c App 通道：api.zhihu.com 用 App UA + x-api-version，不发 web 签名（真机登录态 500 的修复）")
+    fbc = z.read(base + "source/src/fb.c").decode("utf-8", "replace")
+    check('fast_mode == 3 && fb->full_every > 1' in fbc and "fullevery=" in fbc,
+          "fb.c 第 4 档：每 full_every 次翻页补一次 GC16 全刷，周期可配（2..20）")
+    check("was_4" in fbc,
+          "fb.c 第 4 档被驱动拒绝时模式保留（不永久关闭）")
+    check("fullevery" in uic and "(g_cfg.fast + 1) % 4" in uic and "局部+定期全刷" in uic,
+          "ui.c 设置页四档循环 + fullevery 配置持久化")
+    check("[dmssr]" in mnc and "social_parse_messages_html" in mnc,
+          "main.c [dmssr] 离线自检：合成 SSR 页面钉死提取→收割链路")
 
     # 配置合法
     menu = json.loads(z.read(base + "extensions/zhihureader/menu.json").decode("utf-8"))

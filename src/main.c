@@ -350,6 +350,43 @@ static int run_selftest(void) {
         unlink(path);
     }
 
+    /* 1.2.15：web SSR 页面（js-initialData）收消息。
+     * 真机实锤：会话项 url 是 www.zhihu.com/messages?sender_id=... 的
+     * 网页（200 + 149KB HTML），消息内嵌在 initialData 里。用合成的
+     * 迷你页面钉死「提取 → 收割」这条路（含 \u003c 转义与嵌套层级）。 */
+    {
+        const char *html =
+            "<!doctype html><html><head><title>私信 - 知乎</title></head><body>"
+            "<script id=\"js-initialData\" type=\"text/json\">"
+            "{\"data\":{\"viewer\":{\"inbox\":{\"threads\":["
+            "{\"messages\":["
+            "{\"content\":\"\\u003cp\\u003e你好呀\\u003c/p\\u003e\","
+            "\"sender\":{\"name\":\"李四\"},\"created_time\":1794800000},"
+            "{\"content\":\"早上好\",\"sender\":{\"name\":\"我\"},"
+            "\"created_time\":1794800100,\"is_sender\":true}]},"
+            "{\"other\":[{\"content\":\"不像消息\",\"foo\":1}]}]}}}}"
+            "</script></body></html>";
+        MsgList ml;
+        memset(&ml, 0, sizeof(ml));
+        int rc = social_parse_messages_html(html, strlen(html), &ml);
+        ok = rc == 0 && ml.n == 2 &&
+             strcmp(ml.v[0].content, "<p>你好呀</p>") == 0 &&
+             strcmp(ml.v[0].sender, "李四") == 0 &&
+             ml.v[0].created == 1794800000 &&
+             ml.v[1].is_self == 1;
+        printf("[dmssr] %s SSR 页面收消息 n=%d\n", ok ? "OK" : "FAIL", ml.n);
+        ok ? pass++ : fail++;
+        msg_list_free(&ml);
+
+        /* 没有初始数据 / 不是消息结构时要明确失败，不能假装成功返回空列表 */
+        memset(&ml, 0, sizeof(ml));
+        ok = social_parse_messages_html("<html><body>登录页</body></html>", 26, &ml) != 0 &&
+             ml.n == 0;
+        printf("[dmssr2] %s 无 initialData 时失败\n", ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+        msg_list_free(&ml);
+    }
+
     /* 字体缓存压力：长时间阅读后不能出现随机缺字 */
     {
         char ferr[256] = "";

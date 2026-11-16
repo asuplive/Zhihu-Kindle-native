@@ -45,6 +45,9 @@ static const char *MSG_CANDIDATES[] = {
     "https://api.zhihu.com/messages/conversation?thread_id={id}&limit=20&offset=%d",
     "/api/v4/me/message-threads/{id}/messages?limit=20&offset=%d",
     "/api/v4/inbox/{id}/messages?limit=20&offset=%d",
+    /* 1.2.15：web SSR 页面兜底——登录态下是 200 的完整网页，消息内嵌在
+     * js-initialData 里，social_parse_messages_html 负责收。 */
+    "https://www.zhihu.com/messages?thread_id={id}",
 };
 
 static char cfg_threads[512];
@@ -254,6 +257,31 @@ int social_parse_threads(const char *json, size_t len, ThreadList *out) {
     return 0;
 }
 
+/* 从一个"像消息"的 JSON 对象抽 MsgItem（parse_messages 与 1.2.15 的
+ * SSR 收割共用）。 */
+static void msg_from_val(JVal *it, MsgList *out) {
+    MsgItem m;
+    memset(&m, 0, sizeof(m));
+    const char *sk[] = {"content", "text", "body", "excerpt", "snippet"};
+    for (size_t j = 0; j < sizeof(sk) / sizeof(sk[0]); j++) {
+        const char *sv = json_get_str(it, sk[j], NULL);
+        if (sv && *sv) { snprintf(m.content, sizeof(m.content), "%s", sv); break; }
+    }
+    JVal *snd = json_get(it, "sender");
+    if (!snd) snd = json_get(it, "from");
+    if (!snd) snd = json_get(it, "user");
+    if (!snd) snd = json_get(it, "author");
+    const char *nm = snd ? json_get_str(snd, "name", NULL) : NULL;
+    if (!nm) nm = json_get_str(it, "sender_name", NULL);
+    snprintf(m.sender, sizeof(m.sender), "%s", nm ? nm : "对方");
+    const char *ck[] = {"created_time", "created", "created_at", "time"};
+    pick_long(it, &m.created, ck, 4);
+    m.is_self = json_get_bool(it, "is_me", json_get_bool(it, "is_self",
+                       json_get_bool(it, "is_sender",
+                       json_get_bool(it, "from_self", 0))));
+    msg_push(out, m);
+}
+
 /* 解析一个会话里的消息列表 */
 int social_parse_messages(const char *json, size_t len, MsgList *out) {
     JVal *root = json_parse(json, len);
@@ -262,26 +290,103 @@ int social_parse_messages(const char *json, size_t len, MsgList *out) {
     if (!arr) { json_free(root); return -1; }
     for (int k = 0; k < arr->n; k++) {
         JVal *it = unwrap(json_at(arr, k));
-        MsgItem m;
-        memset(&m, 0, sizeof(m));
-        const char *sk[] = {"content", "text", "body", "excerpt", "snippet"};
-        for (size_t j = 0; j < sizeof(sk) / sizeof(sk[0]); j++) {
-            const char *sv = json_get_str(it, sk[j], NULL);
-            if (sv && *sv) { snprintf(m.content, sizeof(m.content), "%s", sv); break; }
-        }
-        JVal *snd = json_get(it, "sender");
-        if (!snd) snd = json_get(it, "from");
-        if (!snd) snd = json_get(it, "user");
-        if (!snd) snd = json_get(it, "author");
-        const char *nm = snd ? json_get_str(snd, "name", NULL) : NULL;
-        if (!nm) nm = json_get_str(it, "sender_name", NULL);
-        snprintf(m.sender, sizeof(m.sender), "%s", nm ? nm : "对方");
-        const char *ck[] = {"created_time", "created", "created_at", "time"};
-        pick_long(it, &m.created, ck, 4);
-        m.is_self = json_get_bool(it, "is_me", json_get_bool(it, "is_self", 0));
-        msg_push(out, m);
+        msg_from_val(it, out);
     }
     json_free(root);
+    return 0;
+}
+
+/* ---------------- 1.2.15：web SSR 页面（js-initialData） ----------------
+ *
+ * 真机日志实锤：会话项自带的 url 是 www.zhihu.com/messages?sender_id=...
+ * 形态的 **网页**（200，149KB HTML），不是 JSON API；而 /api/v4/messages
+ * 等接口在登录态下只回 {"msg":"success"} 空成功体。知乎 web 是服务端
+ * 渲染，页面数据全部内嵌在 <script id="js-initialData" type="text/json">，
+ * 从里面把消息收出来就是正解。
+ *
+ * initialData 的具体键名随版本变（不想硬猜），所以提取后用「通用递归
+ * 收割」：找整个 JSON 树里最像消息的数组（元素=对象、有 content/text
+ * 且有 sender/created_time 之类），取最大的那组。 */
+
+/* 从 HTML 里提取 js-initialData 的 JSON 文本（零拷贝，指向 html 内部）。
+ * 知乎会把 JSON 里的 < 转义成 \u003c，所以字面 "</script>" 不会在数据
+ * 中间出现，找第一个 </script> 就是终点。 */
+static const char *extract_initial_data(const char *html, size_t len, size_t *out_len) {
+    *out_len = 0;
+    if (!html || len < 40) return NULL;
+    const char *mark = strstr(html, "js-initialData");
+    if (!mark) return NULL;
+    const char *p = memchr(mark, '>', html + len - mark);
+    if (!p) return NULL;
+    p++;                                       /* <script ...> 的右括号之后 */
+    const char *end = strstr(p, "</script>");
+    if (!end || (size_t)(end - p) > len) return NULL;
+    /* 跳过前导空白 */
+    while (p < end && (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t')) p++;
+    if (end <= p) return NULL;
+    *out_len = (size_t)(end - p);
+    return p;
+}
+
+/* 一个对象像不像一条私信：有内容（content/text/body），又有归属或时间 */
+static int looks_like_message(JVal *o) {
+    if (!o || o->t != JOBJ) return 0;
+    const char *ck[] = {"content", "text", "body"};
+    int has_c = 0;
+    for (size_t j = 0; j < sizeof(ck) / sizeof(ck[0]); j++) {
+        const char *s = json_get_str(o, ck[j], NULL);
+        if (s && *s) { has_c = 1; break; }
+    }
+    if (!has_c) return 0;
+    const char *snd[] = {"sender", "from", "user", "author", "receiver"};
+    for (size_t j = 0; j < sizeof(snd) / sizeof(snd[0]); j++)
+        if (json_get(o, snd[j])) return 1;
+    if (json_get_str(o, "sender_name", NULL)) return 1;
+    if (json_get_int(o, "created_time", -1) > 0) return 1;
+    if (json_get(o, "is_sender") || json_get(o, "from_self")) return 1;
+    return 0;
+}
+
+/* 递归收割：整个树里最像消息的数组。best/best_n 持有目前最好的一组。 */
+static void harvest_walk(JVal *v, MsgList *best, int *best_n, int depth) {
+    if (!v || depth > 24) return;
+    if (v->t == JARR) {
+        MsgList tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        for (int i = 0; i < v->n; i++) {
+            JVal *e = json_at(v, i);
+            if (looks_like_message(e)) msg_from_val(e, &tmp);
+        }
+        if (tmp.n > *best_n) {
+            msg_list_free(best);
+            *best = tmp;
+            *best_n = tmp.n;
+        } else {
+            msg_list_free(&tmp);
+        }
+        for (int i = 0; i < v->n; i++)
+            harvest_walk(json_at(v, i), best, best_n, depth + 1);
+    } else if (v->t == JOBJ) {
+        for (int i = 0; i < v->n; i++)
+            harvest_walk(v->vals[i], best, best_n, depth + 1);
+    }
+}
+
+/* web SSR 页面 → 消息列表。返回 0 成功。 */
+int social_parse_messages_html(const char *html, size_t len, MsgList *out) {
+    size_t jlen = 0;
+    const char *jd = extract_initial_data(html, len, &jlen);
+    if (!jd) return -1;
+    JVal *root = json_parse(jd, jlen);
+    if (!root) return -1;
+    MsgList best;
+    memset(&best, 0, sizeof(best));
+    int best_n = 0;
+    harvest_walk(root, &best, &best_n, 0);
+    json_free(root);
+    if (best_n <= 0) { msg_list_free(&best); return -1; }
+    msg_list_free(out);
+    *out = best;
     return 0;
 }
 
@@ -389,9 +494,25 @@ static int messages_at(const char *url, const char *id, MsgList *out, int offset
         if (rc == 0) {
             buf_cstr(&b);
             int pr = social_parse_messages(b.p, b.len, out);
+            /* 1.2.15：这个 url 多半是 web SSR 页面（www.zhihu.com/messages?
+             * sender_id=...，200 + 149KB HTML）——页面数据内嵌在
+             * js-initialData 里，从里面收消息才是正解。 */
+            if (pr != 0) pr = social_parse_messages_html(b.p, b.len, out);
             if (pr == 0) { buf_free(&b); return 0; }
-            logmsg("social: messages(url) %s status=%d 200 但解析失败，"
+            logmsg("social: messages(url) %s status=%d 解析失败（JSON 与 SSR 都不行），"
                    "前 160 字节：%.160s", path, st, b.p ? b.p : "");
+            /* 把页面落盘：下轮反馈不需要再猜结构，直接看 initialData 里
+             * 消息放在哪个键下，照着收就行。 */
+            if (strstr(b.p ? b.p : "", "<html")) {
+                char dp[320];
+                snprintf(dp, sizeof(dp), "%s/msg_page_dump.html", zh_home());
+                FILE *f = fopen(dp, "wb");
+                if (f) {
+                    fwrite(b.p, 1, b.len > 400 * 1024 ? 400 * 1024 : b.len, f);
+                    fclose(f);
+                    logmsg("social: SSR 页面已存到 %s（%zu 字节，解析失败时供诊断）", dp, b.len);
+                }
+            }
             buf_free(&b);
         } else {
             buf_free(&b);

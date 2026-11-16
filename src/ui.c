@@ -56,9 +56,11 @@ typedef struct {
     /* 1.2.12：推荐/回答列表样式。0=简洁（标题+作者赞同，行高小适合快划），
      * 1=详细（问题标题 → 回答摘要 2 行 → 作者赞同，留白充足）。默认详细。 */
     int liststyle;
+    /* 1.2.15：第 4 档翻页刷屏「局部 N 次 + 一次全刷」的周期 N（2..20，默认 6） */
+    int fullevery;
 } Config;
 
-static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1 };
+static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1, 6 };
 
 static void config_load(void) {
     char path[320];
@@ -82,6 +84,7 @@ static void config_load(void) {
             else if (strcmp(k, "showbar") == 0) g_cfg.showbar = iv;
             else if (strcmp(k, "rec") == 0) g_cfg.rec = iv;
             else if (strcmp(k, "liststyle") == 0) g_cfg.liststyle = iv;
+            else if (strcmp(k, "fullevery") == 0) g_cfg.fullevery = iv;
             else if (strcmp(k, "refresh") == 0)
                 snprintf(g_cfg.refresh, sizeof(g_cfg.refresh), "%s", v);
         }
@@ -94,8 +97,10 @@ static void config_load(void) {
     /* 1.2.8：images 从"开关"变成三档（0 关 / 1 点按 / 2 自动）。
      * 老配置里的 images=1 是"显示"，正好对应新的"点按"，不用迁移。 */
     if (g_cfg.images < 0 || g_cfg.images > 2) g_cfg.images = 0;
-    /* 1.2.9：fast 三态（1 局部 / 0 整屏闪 / 2 Regal），非法值回到 1 */
-    if (g_cfg.fast < 0 || g_cfg.fast > 2) g_cfg.fast = 1;
+    /* 1.2.9：fast 三态（1 局部 / 0 整屏闪 / 2 Regal）；1.2.15 增第 4 档 3。
+     * 非法值回到 1 */
+    if (g_cfg.fast < 0 || g_cfg.fast > 3) g_cfg.fast = 1;
+    if (g_cfg.fullevery < 2 || g_cfg.fullevery > 20) g_cfg.fullevery = 6;
     /* 推荐条数只认 6/12/18 */
     if (g_cfg.rec != 6 && g_cfg.rec != 12 && g_cfg.rec != 18) g_cfg.rec = 6;
     g_cfg.showbar = g_cfg.showbar ? 1 : 0;
@@ -132,7 +137,8 @@ static void config_save(void) {
                                   strcmp(kt, "size") == 0 || strcmp(kt, "fast") == 0 ||
                                   strcmp(kt, "rotate") == 0 || strcmp(kt, "images") == 0 ||
                                   strcmp(kt, "margin") == 0 || strcmp(kt, "showbar") == 0 ||
-                                  strcmp(kt, "rec") == 0 || strcmp(kt, "liststyle") == 0;
+                                  strcmp(kt, "rec") == 0 || strcmp(kt, "liststyle") == 0 ||
+                                  strcmp(kt, "fullevery") == 0;
                     if (!managed) buf_printf(&keep, "%s\n", line);
                 }
                 if (!nl) break;
@@ -145,9 +151,9 @@ static void config_save(void) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
                      "size=%d\nfast=%d\nrotate=%d\nimages=%d\nmargin=%d\nshowbar=%d\nrec=%d\n"
-                     "liststyle=%d\n",
+                     "liststyle=%d\nfullevery=%d\n",
                      g_cfg.size, g_cfg.fast, g_cfg.rotate, g_cfg.images, g_cfg.margin_pct,
-                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle);
+                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle, g_cfg.fullevery);
     if (n > 0 && (size_t)n < sizeof(buf) && keep.len)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s", buf_cstr(&keep));
     if (n < 0) n = 0;
@@ -1153,10 +1159,13 @@ static void draw_settings(void) {
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.size == 0 ? "小" : (g_cfg.size == 1 ? "中" : "大"));
     /* 1.2.8：fast 不再等于"用 DU 波形"（那是残影和字发虚的根），
      * 而是"翻页要不要整屏闪一下"。默认不闪（局部 + GC16），画面本身是干净的。
-     * 1.2.9 新增第三档 Regal（REAGL 残影补偿波形，实验）。 */
+     * 1.2.9 新增第三档 Regal（REAGL 残影补偿波形，实验）。
+     * 1.2.15 新增第四档：局部 N 次 + 一次全刷（真机反馈：只闪/不闪/Regal
+     * 不够用——局部快但残影攒、全刷干净但每页闪，折中 N 页一清）。 */
     snprintf(vals[1], sizeof(vals[1]), "%s",
-             g_cfg.fast == 2 ? "Regal（实验）" :
-             (g_cfg.fast ? "不闪（局部）" : "整屏闪（最干净）"));
+             g_cfg.fast == 2 ? "Regal（不闪+补偿）" :
+             g_cfg.fast == 3 ? "局部+定期全刷" :
+             (g_cfg.fast ? "局部刷新（不闪）" : "全部刷新（每页闪）"));
     snprintf(vals[2], sizeof(vals[2]), "%d°", g_cfg.rotate * 90);
     static const char *imgmodes[] = { "关闭", "点按加载", "自动加载" };
     if (g_cfg.images < 0 || g_cfg.images > 2) g_cfg.images = 0;
@@ -3248,15 +3257,26 @@ static void handle_tap(int x, int y) {
                 config_save();
                 if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
             } else if (i == 1) {
-                /* 翻页刷屏三档：不闪（局部 GC16）→ 整屏闪 → Regal（实验） */
-                g_cfg.fast = (g_cfg.fast + 1) % 3;
+                /* 翻页刷屏四档：全部刷新 → 局部 → Regal → 局部N次+一次全刷 */
+                g_cfg.fast = (g_cfg.fast + 1) % 4;
                 g.fb.fast_mode = g_cfg.fast;
+                g.fb.full_every = g_cfg.fullevery;
                 config_save();
                 if (g_cfg.fast == 2)
-                    show_message("翻页刷屏：Regal（实验）。\n\nRegal 是 Kindle 的残影补偿波形"
+                    show_message("翻页刷屏：Regal（不闪+补偿）。\n\nRegal 是 Kindle 的残影补偿波形"
                                  "（REAGL，编号 0x8）。\n翻页不闪屏，且驱动会主动补偿残影。\n\n"
                                  "部分机型的驱动不认这个波形，会自动退回局部刷新\n"
                                  "并在 log.txt 里写明原因。");
+                else if (g_cfg.fast == 3)
+                    show_message("翻页刷屏：局部 + 定期全刷。\n\n平时不闪（局部刷新），每 %d 次\n"
+                                 "翻页后补一次全刷清残影。\n\n周期可在 config.txt 写 fullevery=N\n"
+                                 "（2..20，默认 6）自行调整。", g_cfg.fullevery);
+                else if (g_cfg.fast == 0)
+                    show_message("翻页刷屏：全部刷新。\n\n每次翻页整屏闪一下（GC16 全刷），\n"
+                                 "画面最干净、永不叠残影，但翻页稍慢。");
+                else
+                    show_message("翻页刷屏：局部刷新。\n\n每次翻页只刷新变化部分，不闪屏、最快。\n\n"
+                                 "残影会慢慢攒起来，介意的话换\n「局部+定期全刷」或「Regal」。");
                 return;
             } else if (i == 2) {
                 g_cfg.rotate = (g_cfg.rotate + 1) % 4;
@@ -3806,6 +3826,7 @@ int app_run(void) {
     }
     logmsg("app_run: 屏幕 %dx%d %dbpp eink=%d", fb_w(&g.fb), fb_h(&g.fb), g.fb.bpp, g.fb.eink_kind);
     g.fb.fast_mode = g_cfg.fast;
+    g.fb.full_every = g_cfg.fullevery;   /* 1.2.15：第 4 档周期 */
     fb_set_rotate(&g.fb, g_cfg.rotate);
     layout_metrics();
     /* 影子副本：与系统界面共存时，cvm 随时可能往同一块屏上画顶栏。

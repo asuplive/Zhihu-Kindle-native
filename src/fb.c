@@ -235,6 +235,7 @@ static void load_opts(Fb *fb) {
     fb->eips_clean_fail = 0;
     fb->regal = 0;           /* 默认不走 REAGL：老驱动不认 0x8，别拿默认值冒险 */
     fb->autorot = 1;         /* 默认跟随系统硬件旋转（KO3 翻转后触摸同步） */
+    fb->full_every = 6;      /* 1.2.15：第 4 档默认每 6 次翻页补一次全刷 */
 
     size_t n = 0;
     char *s = read_file(path, &n);
@@ -269,6 +270,11 @@ static void load_opts(Fb *fb) {
         } else if (str_startswith(line, "regal=")) {
             /* regal=1：强制翻页走 REAGL（0x8）波形 */
             fb->regal = atoi(line + 6) ? 1 : 0;
+        } else if (str_startswith(line, "fullevery=")) {
+            /* 1.2.15：第 4 档的周期（每 N 次翻页补一次全刷），2..20 */
+            int n = atoi(line + 10);
+            if (n < 2 || n > 20) n = 6;
+            fb->full_every = n;
         } else if (str_startswith(line, "autorot=")) {
             /* autorot=0：不做"系统旋转了触摸跟着转"的补偿 */
             fb->autorot = atoi(line + 8) ? 1 : 0;
@@ -877,6 +883,16 @@ void fb_present(Fb *fb, int full) {
         unsigned wave;
         if (full || !fb->fast_mode) {
             wave = WAVEFORM_MODE_GC16;
+        } else if (fb->fast_mode == 3 && fb->full_every > 1 &&
+                   fb->flip_count % fb->full_every == 0) {
+            /* 1.2.15 第 4 档：平时不闪（GC16 局部），每 full_every 次翻页
+             * 补一次 GC16 全刷，把攒起来的残影清掉。真机反馈：只有 Regal
+             * 一种"不闪"的选择不够——局部刷新快但残影会攒，全刷新干净
+             * 但每页都闪。折中：N 页一清。 */
+            wave = WAVEFORM_MODE_GC16;
+            b[5] = UPDATE_MODE_FULL;
+            if (fb->flip_count % (fb->full_every * 20) == fb->full_every)
+                logmsg("fb: 第4档 定期全刷（每 %d 次翻页）", fb->full_every);
         } else if (fb->fast_mode == 2 || fb->regal) {
             /* 1.2.9 Regal（实验）：REAGL=0x8，"残影补偿"波形。
              * KOReader 在 PW2 上的用法是 REAGL + UPDATE_MODE_FULL：
@@ -917,8 +933,11 @@ void fb_present(Fb *fb, int full) {
         if (r != 0 && !full && fb->fast_mode) {
             /* 有的固件只认 GC16 + FULL，DU/REAGL/PARTIAL 直接 EINVAL。
              * 先补一帧全刷：能把画面推上去就先推上去。
-             * Regal 被拒就永久关掉（fast_mode 退回 1=局部 GC16），并写日志。 */
+             * Regal 被拒就永久关掉（fast_mode 退回 1=局部 GC16），并写日志。
+             * 1.2.15：第 4 档（局部+定期全刷）不关——它平时用的就是最基本的
+             * GC16/PARTIAL，被拒时本次已用全刷兜底，下翻页接着试局部。 */
             int was_regal = (fb->fast_mode == 2);
+            int was_4 = (fb->fast_mode == 3);
             b[4] = WAVEFORM_MODE_GC16;
             b[5] = UPDATE_MODE_FULL;
             errno = 0;
@@ -927,6 +946,8 @@ void fb_present(Fb *fb, int full) {
                 if (was_regal) {
                     logmsg("fb: Regal(REAGL) 被拒 errno=%d，改 GC16/FULL 成功，本次起关闭 Regal", e);
                     fb->fast_mode = 1;
+                } else if (was_4) {
+                    logmsg("fb: 第4档局部刷新被拒 errno=%d，本次以全刷兜底（模式保留）", e);
                 } else {
                     logmsg("fb: 快刷被拒 errno=%d，改 GC16/FULL 成功，本次起关闭 fast_mode", e);
                     fb->fast_mode = 0;

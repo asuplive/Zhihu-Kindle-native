@@ -52,6 +52,11 @@ static const char *UA_PC =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/* 1.2.15：api.zhihu.com 是 App 网关，对 web 浏览器 UA 一律不认（游客 401
+ * 之后登录态直接 500）。走 App 通道的请求（私信）切 App UA。 */
+static const char *UA_APP =
+    "osee2unifiedRelease/10.55.0 (Linux; Android 11; ZH-Kindle-Reader)";
+
 /* config.txt 的 ua=pc|mobile 可以不改代码切换（默认 pc）。
  * 万一哪天桌面 UA 反而更容易被拦，用户在设备上改一行就能回退。 */
 static int ua_is_pc(void) {
@@ -261,16 +266,28 @@ static int api_call_ref(const char *method, const char *path, const char *body,
      * 调完这里如果不还原，扫码就会被当成桌面浏览器而失败。 */
     char ua_prev[256];
     snprintf(ua_prev, sizeof(ua_prev), "%s", http_user_agent());
-    http_set_user_agent(ua_is_pc() ? UA_PC : NULL);   /* NULL = 用默认移动端 UA */
+    /* 1.2.15：api.zhihu.com（App 网关）与 www.zhihu.com（web）分头处理。
+     * 真机日志：私信走 App 通道时带 web 的 zse-93/96 签名 → 登录态 500
+     * （网关不认这个签名组合）；游客 401 → 认证错误，说明路由本身在。
+     * App 通道改用 App UA + App 风格头，不发 web 签名。 */
+    int is_app_api = strncmp(url, "https://api.zhihu.com", 21) == 0;
+    if (is_app_api) http_set_user_agent(UA_APP);
+    else http_set_user_agent(ua_is_pc() ? UA_PC : NULL);   /* NULL = 用默认移动端 UA */
 
     Buf hdr;
     buf_init(&hdr);
-    buf_printf(&hdr, "x-zse-93: %s\r\nx-zse-96: %s\r\n", ZSE93_VERSION, sig);
-    if (zst[0]) buf_printf(&hdr, "x-zst-81: %s\r\n", zst);
-    buf_printf(&hdr, "x-requested-with: fetch\r\n"
-                     "Accept: application/json, text/plain, */*\r\n"
-                     "Referer: %s\r\n"
-                     "Origin: https://www.zhihu.com\r\n", ref);
+    if (is_app_api) {
+        buf_printf(&hdr, "x-api-version: 3.0.91\r\n"
+                         "x-app-za: OS=Android&Release=11&Model=Kindle&VersionCode=2312\r\n"
+                         "Accept: application/json\r\n");
+    } else {
+        buf_printf(&hdr, "x-zse-93: %s\r\nx-zse-96: %s\r\n", ZSE93_VERSION, sig);
+        if (zst[0]) buf_printf(&hdr, "x-zst-81: %s\r\n", zst);
+        buf_printf(&hdr, "x-requested-with: fetch\r\n"
+                         "Accept: application/json, text/plain, */*\r\n"
+                         "Referer: %s\r\n"
+                         "Origin: https://www.zhihu.com\r\n", ref);
+    }
     if (body) buf_adds(&hdr, "Content-Type: application/json\r\n");
     buf_printf(&hdr, "Cookie: %s\r\n", g_cookie);
 

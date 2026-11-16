@@ -25,8 +25,12 @@ typedef struct {
                               * 4=交给系统 eips 刷（KO3 上的实际后路） 9=模拟器 */
     uint32_t marker;
     int fast_mode;           /* 0=整屏闪（GC16/FULL） 1=不闪（局部 GC16）
-                              * 2=Regal（REAGL 波形，1.2.9 实验） */
+                              * 2=Regal（REAGL 波形，1.2.9 实验）
+                              * 3=局部 N 次 + 定期一次全刷（1.2.15，N=full_every） */
     int flip_count;
+    /* 1.2.15：第 4 档「局部+定期全刷」的周期（翻页次数）。config.txt
+     * 写 fullevery=N 可调，默认 6。只在 fast_mode==3 时生效。 */
+    int full_every;
 
     /* 1.2.9：硬件旋转跟踪。framework（cvm）在设备翻转时会改 var.rotate，
      * 我们的像素会被显示层转过去（"界面旋转了"），但触摸坐标没跟

@@ -50,6 +50,9 @@ int social_messages2(const char *url, const char *thread_id, MsgList *out, int o
 /* 解析（纯函数，供离线自检：真机上没有登录态可用来跑测试） */
 int social_parse_threads(const char *json, size_t len, ThreadList *out);
 int social_parse_messages(const char *json, size_t len, MsgList *out);
+/* 1.2.15：web SSR 页面（js-initialData）→ 消息列表。会话项自带的 url
+ * 实测是 www.zhihu.com/messages?sender_id=... 网页而非 API。 */
+int social_parse_messages_html(const char *html, size_t len, MsgList *out);
 
 /* 端点诊断：依次记录每个候选端点的 HTTP 状态，写入日志，便于真机排查 */
 void social_probe(void);
