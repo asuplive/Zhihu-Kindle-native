@@ -3,7 +3,7 @@
 #define ZH_UI_H
 
 /* 全局版本号：main.c 与界面共用，改一处即可 */
-#define ZH_VERSION "1.3.2"
+#define ZH_VERSION "1.3.3"
 
 int app_run(void);
 int app_preview(const char *html_path, int max_pages);
@@ -13,6 +13,7 @@ int app_preview(const char *html_path, int max_pages);
  * 如果改一次字号就把它冲掉，下次启动又会掉回会重启的路径。 */
 int ui_config_roundtrip_test(void);
 int ui_nav_stack_test(void);
+int ui_refresh_route_test(void);   /* 1.3.3 定稿第1条：刷屏两分法路由自检 */
 
 /* 自检用：三档图片模式（关 / 点按 / 自动）的占位前缀与排队规则。 */
 int ui_img_mode_test(void);

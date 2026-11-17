@@ -580,6 +580,19 @@ static void present_fast(void) {
     fb_present(&g.fb, 0);
     g.screen_sig = fb_sample_sig(&g.fb);
 }
+/* 1.3.3 定稿（第1条）：屏内刷新的归属判定，覆盖 App 内全部刷屏场景。
+ *   翻页刷屏（g_cfg.fast）：问题/回答列表页（SCR_LIST）+ 答案详情浏览翻页
+ *                          （SCR_READER）
+ *   主界面刷屏（g_cfg.uifast）：其余全部界面（首页/设置/私信会话与消息/
+ *                              账号/关于…）——SCR_DMREAD 私信消息归此类。
+ * 调用方只需声明"这是一次屏内刷新"，具体归哪个设置档由当前界面自动决定，
+ * 两分法不重不漏。换屏（draw 前未打标记）仍走全刷，防叠屏。 */
+static void mark_inplace_refresh(void) {
+    if (g.scr == SCR_LIST || g.scr == SCR_READER)
+        g.fast_next = 1;
+    else
+        g.ui_fast_next = 1;
+}
 /* 换屏专用：整屏换内容一律走全刷（GC16 / eips -f -g），否则上一屏的字会
  * 留在纸上——这就是真机照片里"每个界面都重叠"的根。只有明确标记了
  * "这一屏只是翻一页"（g.fast_next）才允许走局部更新。 */
@@ -1176,7 +1189,7 @@ static void reader_goto(int page) {
     if (page > g.lay.npages - 1) page = g.lay.npages - 1;
     if (page == g.page) return;
     g.page = page;
-    g.fast_next = 1;      /* 翻页：允许局部刷新（快，且整屏都变，残影看不清） */
+    mark_inplace_refresh();   /* 1.3.3：答案详情翻页 → 翻页刷屏档 */
     draw_reader();
 }
 
@@ -2068,10 +2081,15 @@ static int fetch_job(const char *path, const char *title, char *out_path, size_t
  * 子列表按返回时搬回去。搬 = 指针移交（不复制数据），O(1)。
  * 注意顺序：先 push 再 list_reset（reset 会释放 g.list）。 */
 static void list_push_parent(void) {
-    if (g.scr != SCR_LIST || g.list.v == NULL) {
-        /* 1.3.2：被拒不压栈要留痕——真机 run.log 一眼定位层级断链 */
-        logmsg("nav: push 被拒 scr=%d list.v=%p（回答列表返回会直回主页）",
-               g.scr, (void *)g.list.v);
+    /* 1.3.3 定稿（第2条）：压栈只判断"当前列表有没有数据"，彻底不碰 g.scr。
+     * 根因复盘：1.2.13~1.3.2 连续三版在这里写了 g.scr==SCR_LIST 守卫，
+     * 而调用点都在网络任务（fetch_job/run_job）之后——show_loading 把
+     * scr 换成 LOADING，消息框换成 MESSAGE，真机上总有一条路径的 scr
+     * 没恢复到位，守卫就拒绝压栈 → 回答列表返回直回主页。
+     * 压栈的本质只是"把 g.list 存成上一层"，与界面状态无关：只要 g.list
+     * 有数据就压。这样就和网络/消息状态机彻底解耦，不再有漏网路径。 */
+    if (g.list.v == NULL) {
+        logmsg("nav: push 跳过——当前没有列表数据（g.list.v=NULL）");
         g.parent_valid = 0;
         return;
     }
@@ -2140,25 +2158,26 @@ int ui_nav_stack_test(void) {
          g.list.v == NULL && g.list.n == 0 &&
          g.parent_sel == 1 && strcmp(g.parent_kind, "hot") == 0;
 
-    /* 1.3.2 回归钉子（真机两次实锤：回答列表返回直接回主页）。
-     * 走真实链路而不是手动摆状态：热榜列表 → loading_scr_enter（进加载页，
-     * 记录来源）→ 任务成功 loading_scr_restore → scr 必须回到 LIST →
-     * push 必须成功。1.3.1 用 scr_prev 恢复是错的（它只在 show_message
-     * 时更新，没弹过消息时是过期值=主页），恢复完还是 LIST 之外的界面，
-     * 守卫照样拒绝压栈——自检又没拦住，这次必须用 enter/restore 本体。 */
-    list_pop_parent();           /* 取回第一次 push 的热榜数据，从头走真实链路 */
-    g.scr = SCR_LIST;            /* 此刻站在热榜列表上（g.list 有 2 条） */
-    g.scr_prev = SCR_HOME;       /* 没弹过消息：scr_prev 是过期值（历史坑） */
-    /* 先钉"LOADING 态直接 push 必须被拒"（防止有人删守卫） */
-    loading_scr_enter();
-    ok = ok && g.scr == SCR_LOADING && g.load_scr_prev == SCR_LIST;
+    /* 1.3.3 回归钉子（定稿第2条，真机三次实锤：回答列表返回直接回主页）。
+     * 根因是 push 依赖 g.scr==SCR_LIST，而网络任务把 scr 改成 LOADING/MESSAGE，
+     * 真机总有一条路径没恢复到位 → 守卫拒压 → 层级栈空 → 返回直回主页。
+     * 1.3.3 去掉 scr 守卫：只要 g.list 有数据就压，与界面状态彻底解耦。
+     * 自检故意在 LOADING/MESSAGE 态压栈，必须照样成功——钉死这条。 */
+    list_pop_parent();           /* 取回第一次 push 的热榜数据，从头走 */
+    g.scr = SCR_LOADING;         /* 网络任务后的真实状态（历史坑） */
+    g.scr_prev = SCR_HOME;       /* 弹过消息：scr_prev 是过期值 */
     list_push_parent();
-    ok = ok && g.parent_valid == 0 && g.list.n == 2;   /* 拒绝且不动 g.list */
-    /* 任务成功：恢复到来源界面，再压栈——必须成功 */
-    loading_scr_restore();
-    ok = ok && g.scr == SCR_LIST;
+    /* 注意 pop 会把 scr 归位成 LIST；这里只钉"LOADING 态下 push 照样成功"
+     * ——parent_valid 和条目数正确即证明守卫已不再看 scr。 */
+    ok = ok && g.parent_valid == 1 &&
+         g.parent_list.n == 2 && strcmp(g.parent_kind, "hot") == 0;
+    /* 换一个非法状态再压：MESSAGE 态也必须成功（消息框弹过后）。
+     * 这一次压栈保留下来，供后面"装子列表→pop 回热榜"的断言使用。 */
+    list_pop_parent();
+    g.scr = SCR_MESSAGE;
     list_push_parent();
     ok = ok && g.parent_valid == 1;
+    g.scr = SCR_LIST;
 
     /* 模拟 list_reset 后装了子列表 */
     api_list_free(&g.list);
@@ -2178,6 +2197,33 @@ int ui_nav_stack_test(void) {
     api_list_free(&g.list);
     memset(&g.list, 0, sizeof(g.list));
     list_clear_parent();
+    return ok;
+}
+
+/* 1.3.3 定稿第1条自检：刷屏归属两分法。
+ * 翻页刷屏(SCR_LIST/SCR_READER) → fast_next；其余界面 → ui_fast_next。 */
+int ui_refresh_route_test(void) {
+    int scr0 = g.scr, f0 = g.fast_next, uf0 = g.ui_fast_next, ok = 1;
+    struct { int scr; int want_fast; } cases[] = {
+        { SCR_LIST,    1 },   /* 问题/回答列表页 → 翻页刷屏 */
+        { SCR_READER,  1 },   /* 答案详情浏览翻页 → 翻页刷屏 */
+        { SCR_HOME,    0 },   /* 首页 → 主界面刷屏 */
+        { SCR_SETTINGS,0 },   /* 设置 → 主界面刷屏 */
+        { SCR_DMLIST,  0 },   /* 私信会话 → 主界面刷屏 */
+        { SCR_DMREAD,  0 },   /* 私信消息 → 主界面刷屏 */
+        { SCR_ACCOUNT, 0 },   /* 账号 → 主界面刷屏 */
+        { SCR_ABOUT,   0 },   /* 关于 → 主界面刷屏 */
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        g.fast_next = 0; g.ui_fast_next = 0;
+        g.scr = cases[i].scr;
+        mark_inplace_refresh();
+        if (cases[i].want_fast)
+            ok = ok && g.fast_next == 1 && g.ui_fast_next == 0;
+        else
+            ok = ok && g.fast_next == 0 && g.ui_fast_next == 1;
+    }
+    g.scr = scr0; g.fast_next = f0; g.ui_fast_next = uf0;
     return ok;
 }
 
@@ -3372,7 +3418,7 @@ static void list_page(int step) {
      * "保持选中项可见"的规则会把页首拉回上一页末尾（翻页后首行是第 2 条）。 */
     g.list_top = page * per;
     if (g.list_sel >= g.list.n) g.list_sel = g.list.n > 0 ? g.list.n - 1 : 0;
-    g.ui_fast_next = 1;   /* 1.3.0：列表翻页走「主界面刷屏」档 */
+    mark_inplace_refresh();   /* 1.3.3：列表页翻页 → 翻页刷屏档 */
     draw_list();
 }
 
@@ -3990,6 +4036,30 @@ static void sim_answers_demo(void) {
 
 static void handle_key(int code) {
     if (code == 997) { sim_demo_open(); return; }
+    if (code == 989) {   /* 1.3.3：模拟"热榜→点问题压栈→回答列表"，验证返回回热榜 */
+        if (!getenv("ZH_SIM_LIVE")) return;
+        /* 父：热榜列表 */
+        api_list_free(&g.list);
+        memset(&g.list, 0, sizeof(g.list));
+        const char *jh = "{\"data\":[{\"type\":\"question\",\"id\":\"q1\","
+                         "\"question\":{\"title\":\"热榜问题甲\"}},"
+                         "{\"type\":\"question\",\"id\":\"q2\","
+                         "\"question\":{\"title\":\"热榜问题乙\"}}]}";
+        api_parse_feed(jh, strlen(jh), &g.list);
+        strcpy(g.list_kind, "hot"); strcpy(g.list_title, "热榜");
+        g.scr = SCR_LIST;
+        list_push_parent();      /* 模拟 act_question 里进入子列表前压栈 */
+        /* 子：该问题的回答列表（标题明显区别于 anslist 演示，便于帧差检测） */
+        list_reset("【层级返回演示】点返回应回热榜", "answers");
+        const char *ja = "{\"data\":[{\"type\":\"answer\",\"id\":\"a1\","
+                         "\"content\":\"这是第一条回答的摘要内容\"},"
+                         "{\"type\":\"answer\",\"id\":\"a2\","
+                         "\"content\":\"这是第二条回答的摘要内容\"}]}";
+        api_parse_feed(ja, strlen(ja), &g.list);
+        g.scr = SCR_LIST;
+        draw_list();
+        return;
+    }
     if (code == 990) {   /* 1.3.0：拼音输入法演示（离线） */
         input_start("搜索", 1, "");
         snprintf(g.ime_py, sizeof(g.ime_py), "nihao");
@@ -4035,8 +4105,8 @@ static void handle_key(int code) {
             break;
         case SCR_LIST:
             if (code == 158 || code == 102) nav_back();   /* 1.2.13：返回上一项 */
-            else if (code == 103 || code == 105 || code == 104) { if (g.list_sel > 0) { g.list_sel--; g.ui_fast_next = 1; draw_list(); } }
-            else if (code == 108 || code == 106 || code == 109) { if (g.list_sel + 1 < g.list.n) { g.list_sel++; g.ui_fast_next = 1; draw_list(); } }
+            else if (code == 103 || code == 105 || code == 104) { if (g.list_sel > 0) { g.list_sel--; mark_inplace_refresh(); draw_list(); } }
+            else if (code == 108 || code == 106 || code == 109) { if (g.list_sel + 1 < g.list.n) { g.list_sel++; mark_inplace_refresh(); draw_list(); } }
             else if (code == 28 || code == 96) {
                 if (g.list_sel < g.list.n) {
                     if (strcmp(g.list_kind, "collections") == 0) {
@@ -4049,8 +4119,8 @@ static void handle_key(int code) {
             }
             break;
         case SCR_HOME:
-            if (code == 108 || code == 106) { g.list_sel = (g.list_sel + 1) % HOME_COUNT; g.ui_fast_next = 1; draw_home(); }
-            else if (code == 103 || code == 105) { g.list_sel = (g.list_sel + HOME_COUNT - 1) % HOME_COUNT; g.ui_fast_next = 1; draw_home(); }
+            if (code == 108 || code == 106) { g.list_sel = (g.list_sel + 1) % HOME_COUNT; mark_inplace_refresh(); draw_home(); }
+            else if (code == 103 || code == 105) { g.list_sel = (g.list_sel + HOME_COUNT - 1) % HOME_COUNT; mark_inplace_refresh(); draw_home(); }
             else if (code == 28 || code == 96)
                 handle_tap(g.W / 2, home_top() + home_row_h() * g.list_sel + 1);
             else if (code == 158) g.quit = 1;

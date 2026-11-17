@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.3.2"
+VER = "1.3.3"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -307,9 +307,27 @@ def main():
     check("loading_scr_enter();" in uic and "g.load_scr_prev = g.scr;" in uic and
           "g.scr = g.load_scr_prev;" in uic,
           "ui.c 1.3.2：进入加载页记录真实来源界面（scr_prev 是过期值，1.3.1 恢复到主页导致压栈仍被拒）")
-    check("loading_scr_enter();" in uic and "loading_scr_restore();" in uic and
-          "ok = ok && g.parent_valid == 1;" in uic,
-          "ui.c [nav] 自检走真实链路 enter→restore→push（1.3.2 钉死）")
+    # 1.3.3 定稿第2条：压栈彻底去掉 g.scr 守卫（三版连栽的根），只看 g.list.v
+    check("if (g.list.v == NULL) {" in uic and "1.3.3 定稿（第2条）" in uic and
+          "g.scr != SCR_LIST" not in uic.split("static void list_push_parent")[1].split("static int list_pop_parent")[0],
+          "ui.c 1.3.3：list_push_parent 去掉 g.scr 守卫（1.2.13~1.3.2 层级返回三版失效的根因）")
+    check("g.scr = SCR_LOADING;" in uic and "g.scr = SCR_MESSAGE;" in uic and
+          "MESSAGE 态也必须成功" in uic,
+          "ui.c [nav] 自检钉死 LOADING/MESSAGE 态压栈照样成功（去 scr 依赖）")
+    # KO3 模拟器新增 hotans 离线注入：直接读工作区文件（打包内不一定含模拟器）
+    try:
+        ksim = open(os.path.join(os.path.dirname(__file__), '..', '..', 'KO3-模拟器', 'kindle_sim.py'), encoding='utf-8').read()
+        check("sim.inject('hotans')" in ksim,
+              "KO3 模拟器新增 hotans 离线注入：热榜→压栈→回答列表→返回回热榜端到端")
+    except OSError:
+        pass
+    # 1.3.3 定稿第1条：刷屏两分法路由
+    check("static void mark_inplace_refresh(void)" in uic and
+          "g.scr == SCR_LIST || g.scr == SCR_READER" in uic and
+          "int ui_refresh_route_test(void)" in uic,
+          "ui.c 1.3.3：刷屏两分法——列表/答案详情→翻页刷屏，其余→主界面刷屏（[ref] 自检）")
+    check("[ref  ]" in mnc and "刷屏两分法" in mnc,
+          "main.c [ref] 自检覆盖刷屏两分法全部界面")
     check("g.scr = SCR_READER;" in uic and
           "成功路径如果不换回来" in uic,
           "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")

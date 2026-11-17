@@ -909,6 +909,15 @@ static int run_selftest(void) {
         ok ? pass++ : fail++;
     }
 
+    /* [ref ]（1.3.3 定稿第1条）：刷屏归属两分法 */
+    {
+        extern int ui_refresh_route_test(void);
+        ok = ui_refresh_route_test();
+        printf("[ref  ] %s 刷屏两分法：列表/答案详情→翻页刷屏，其余→主界面刷屏\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
     /* 1.2.9：排版首页高度——标题只占第一页，后续页整页都是正文。 */
     {
         char ferr[256] = "";
