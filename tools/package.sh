@@ -3,7 +3,7 @@
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$ROOT/release"
-NAME="知乎阅读-Kindle-1.3.3"
+NAME="知乎阅读-Kindle-1.3.4"
 PKG="$OUT/$NAME"
 
 rm -rf "$PKG"

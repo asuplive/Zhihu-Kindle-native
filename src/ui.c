@@ -63,9 +63,17 @@ typedef struct {
      * 四档与 fast 完全一致；阅读页翻页继续用 fast，两套互不干扰。
      * 换屏（首页→列表、打开文章）永远全刷，否则会叠屏。 */
     int uifast;
+    /* 1.3.4：一次性迁移标记。老 config.txt 里写着 fast=1/uifast=1，
+     * 只改编译默认值到不了老用户——开机读到没有 rglmig 标记就把两项刷成
+     * Regal(2)，之后写回标记；用户此后再手动选别的档也不会被反复覆盖。 */
+    int rglmig;
 } Config;
 
-static Config g_cfg = { 1, 1, 0, 0, 7, "", 0, 6, 1, 6, 1 };
+/* 1.3.4：默认两项刷屏都改为 Regal(2)。
+ * fast=2 翻页刷屏；uifast=2 主界面刷屏。
+ * Regal=REAGL 波形整屏更新但不闪白，配合 1.3.4 让 full=1 也走 REAGL，
+ * 主界面换屏/加载/消息框不再黑闪。 */
+static Config g_cfg = { 1, 2, 0, 0, 7, "", 0, 6, 1, 6, 2, 0 };
 
 static void config_load(void) {
     char path[320];
@@ -91,12 +99,21 @@ static void config_load(void) {
             else if (strcmp(k, "liststyle") == 0) g_cfg.liststyle = iv;
             else if (strcmp(k, "fullevery") == 0) g_cfg.fullevery = iv;
             else if (strcmp(k, "uifast") == 0) g_cfg.uifast = iv;
+            else if (strcmp(k, "rglmig") == 0) g_cfg.rglmig = iv ? 1 : 0;
             else if (strcmp(k, "refresh") == 0)
                 snprintf(g_cfg.refresh, sizeof(g_cfg.refresh), "%s", v);
         }
         line = strtok(NULL, "\n");
     }
     free(s);
+    /* 1.3.4 一次性迁移：老配置没有 rglmig 标记 -> 把两项刷屏强制成 Regal(2)，
+     * 让老用户升级后也吃到"主界面不闪"。标记随下次存盘写回；此后用户再
+     * 手动选别的档不会被覆盖。全新设备无 config.txt，直接用编译默认(2)。 */
+    if (!g_cfg.rglmig) {
+        g_cfg.fast = 2;
+        g_cfg.uifast = 2;
+        g_cfg.rglmig = 1;
+    }
     if (g_cfg.size < 0 || g_cfg.size > 2) g_cfg.size = 1;
     if (g_cfg.rotate < 0 || g_cfg.rotate > 3) g_cfg.rotate = 0;
     if (g_cfg.margin_pct < 2 || g_cfg.margin_pct > 15) g_cfg.margin_pct = 7;
@@ -104,11 +121,11 @@ static void config_load(void) {
      * 老配置里的 images=1 是"显示"，正好对应新的"点按"，不用迁移。 */
     if (g_cfg.images < 0 || g_cfg.images > 2) g_cfg.images = 0;
     /* 1.2.9：fast 三态（1 局部 / 0 整屏闪 / 2 Regal）；1.2.15 增第 4 档 3。
-     * 非法值回到 1 */
-    if (g_cfg.fast < 0 || g_cfg.fast > 3) g_cfg.fast = 1;
+     * 1.3.4：默认改 Regal(2)，非法值回到 2 */
+    if (g_cfg.fast < 0 || g_cfg.fast > 3) g_cfg.fast = 2;
     if (g_cfg.fullevery < 2 || g_cfg.fullevery > 20) g_cfg.fullevery = 6;
-    /* 1.3.0：主界面刷屏同四档，非法值回 1（局部） */
-    if (g_cfg.uifast < 0 || g_cfg.uifast > 3) g_cfg.uifast = 1;
+    /* 1.3.0：主界面刷屏同四档；1.3.4 默认改 Regal(2)，非法值回 2 */
+    if (g_cfg.uifast < 0 || g_cfg.uifast > 3) g_cfg.uifast = 2;
     /* 推荐条数只认 6/12/18 */
     if (g_cfg.rec != 6 && g_cfg.rec != 12 && g_cfg.rec != 18) g_cfg.rec = 6;
     g_cfg.showbar = g_cfg.showbar ? 1 : 0;
@@ -146,7 +163,8 @@ static void config_save(void) {
                                   strcmp(kt, "rotate") == 0 || strcmp(kt, "images") == 0 ||
                                   strcmp(kt, "margin") == 0 || strcmp(kt, "showbar") == 0 ||
                                   strcmp(kt, "rec") == 0 || strcmp(kt, "liststyle") == 0 ||
-                                  strcmp(kt, "fullevery") == 0 || strcmp(kt, "uifast") == 0;
+                                  strcmp(kt, "fullevery") == 0 || strcmp(kt, "uifast") == 0 ||
+                                  strcmp(kt, "rglmig") == 0;
                     if (!managed) buf_printf(&keep, "%s\n", line);
                 }
                 if (!nl) break;
@@ -159,9 +177,10 @@ static void config_save(void) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
                      "size=%d\nfast=%d\nrotate=%d\nimages=%d\nmargin=%d\nshowbar=%d\nrec=%d\n"
-                     "liststyle=%d\nfullevery=%d\nuifast=%d\n",
+                     "liststyle=%d\nfullevery=%d\nuifast=%d\nrglmig=%d\n",
                      g_cfg.size, g_cfg.fast, g_cfg.rotate, g_cfg.images, g_cfg.margin_pct,
-                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle, g_cfg.fullevery, g_cfg.uifast);
+                     g_cfg.showbar, g_cfg.rec, g_cfg.liststyle, g_cfg.fullevery, g_cfg.uifast,
+                     g_cfg.rglmig);
     if (n > 0 && (size_t)n < sizeof(buf) && keep.len)
         n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s", buf_cstr(&keep));
     if (n < 0) n = 0;
@@ -218,14 +237,16 @@ int ui_config_roundtrip_test(void) {
     snprintf(path, sizeof(path), "%s/config.txt", zh_home());
     /* 三个手写键一起验：refresh=（刷新路径）、eips=（后路开关）、blankpulse=
      * 都是排障用的，任何一个被冲掉，用户下次开机会掉回会重启/冻屏的状态。 */
-    const char *seed = "size=2\nfast=0\nrotate=1\nimages=2\nmargin=9\n"
+    /* 1.3.4：种子带 rglmig=1，避免一次性迁移改写 fast，确保往返一致性可验 */
+    const char *seed = "size=2\nfast=0\nuifast=3\nrglmig=1\nrotate=1\nimages=2\nmargin=9\n"
                        "refresh=pan\neips=off\nblankpulse=1\n";
     if (write_file_atomic(path, seed, strlen(seed)) != 0) return 0;
 
     g_cfg.refresh[0] = 0;
     config_load();
     int loaded = (strcmp(g_cfg.refresh, "pan") == 0) && g_cfg.size == 2 &&
-                 g_cfg.images == 2;   /* 1.2.8：images 是三档，2 不能被夹成 1 */
+                 g_cfg.images == 2 && g_cfg.fast == 0 && g_cfg.uifast == 3 &&
+                 g_cfg.rglmig == 1;   /* 1.3.4：带迁移标记时不被改写；images 三档不被夹成 1 */
 
     config_save();
     size_t n = 0;
@@ -235,9 +256,11 @@ int ui_config_roundtrip_test(void) {
     if (s) free(s);
     unlink(path);
 
-    /* 复位成默认值，别把测试数据带进后面的流程 */
+    /* 复位成默认值，别把测试数据带进后面的流程（1.3.4：两项默认 Regal） */
     g_cfg.size = 1;
-    g_cfg.fast = 1;
+    g_cfg.fast = 2;
+    g_cfg.uifast = 2;
+    g_cfg.rglmig = 0;
     g_cfg.rotate = 0;
     g_cfg.images = 0;
     g_cfg.margin_pct = 7;

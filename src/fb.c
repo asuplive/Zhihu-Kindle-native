@@ -858,6 +858,73 @@ static void present_eips(Fb *fb, int full) {
              rc, fb->eips_ok, fb->eips_fail, fb->eips_mode, want_full);
 }
 
+/* 1.3.4：波形决策抽成纯函数，fb_present 与自检共用，杜绝"自检过、真机没生效"。
+ *
+ * 修复的核心：Regal(fast_mode==2 / regal=1) 必须覆盖**所有**刷新，包括
+ * 整屏换内容 full=1。1.3.3 及以前的顺序是：
+ *     if (full || !fast_mode) wave = GC16;        ← full=1 先命中，黑闪
+ *     else if (fast_mode==2 || regal) wave = REAGL; ← 永远轮不到
+ * 所以阅读翻页(full=0)能用 Regal 不闪，而主界面换屏/加载/消息框(full=1)
+ * 一律 GC16 全刷黑闪——这就是"设了 Regal 主界面还是闪"的根因。
+ * 现在把 Regal 提到最前：REAGL + UPDATE_MODE_FULL 在 Kindle 上是标准的
+ * "整屏更新但不闪白"波形（KOReader 在 PW2 的用法），既是全刷会做残影补偿、
+ * 不会叠屏，又不产生 GC16 那种黑白闪。
+ *
+ * 参数 full 语义保留：非 Regal 时 full=1 仍是 GC16 全刷、full=0 走局部/第4档。 */
+unsigned int fb_wave_for(int fast_mode, int regal, int full, int flip_count,
+                         int full_every, int use_du, int *out_mode) {
+    /* 1. Regal 最高优先级：翻页、换屏都不闪（REAGL 自带残影补偿） */
+    if (fast_mode == 2 || regal) {
+        if (out_mode) *out_mode = UPDATE_MODE_FULL;
+        return WAVEFORM_MODE_REAGL;
+    }
+    /* 2. 非 Regal 的整屏更新：清晰档(0)或明确换屏 → GC16 全刷 */
+    if (full || !fast_mode) {
+        if (out_mode) *out_mode = UPDATE_MODE_FULL;
+        return WAVEFORM_MODE_GC16;
+    }
+    /* 3. 第4档：局部 N 次 + 定期一次 GC16 全刷 */
+    if (fast_mode == 3 && full_every > 1 && (flip_count % full_every) == 0) {
+        if (out_mode) *out_mode = UPDATE_MODE_FULL;
+        return WAVEFORM_MODE_GC16;
+    }
+    /* 4. 手写的 DU 档：每 8 次补一次 GC16 */
+    if (use_du) {
+        if (out_mode) *out_mode = UPDATE_MODE_PARTIAL;
+        return (flip_count % 8 == 0) ? WAVEFORM_MODE_GC16 : WAVEFORM_MODE_DU;
+    }
+    /* 5. 默认（局部 GC16，不闪） */
+    if (out_mode) *out_mode = UPDATE_MODE_PARTIAL;
+    return WAVEFORM_MODE_GC16;
+}
+
+/* 自检（无需真机）：把波形规则钉死，防止再出现"设了 Regal 换屏却黑闪"。 */
+int fb_refresh_wave_test(void) {
+    int m = -1;
+    int ok = 1;
+    /* Regal + 整屏换内容：必须 REAGL+FULL，绝不能 GC16（黑闪的根） */
+    if (fb_wave_for(2, 0, 1, 1, 6, 0, &m) != WAVEFORM_MODE_REAGL) ok = 0;
+    if (m != UPDATE_MODE_FULL) ok = 0;
+    /* regal=1 强制：即使 fast_mode=1，整屏也走 REAGL */
+    if (fb_wave_for(1, 1, 1, 5, 6, 0, &m) != WAVEFORM_MODE_REAGL) ok = 0;
+    /* Regal + 翻页(full=0)：同样 REAGL */
+    if (fb_wave_for(2, 0, 0, 2, 6, 0, &m) != WAVEFORM_MODE_REAGL) ok = 0;
+    /* 非 Regal 清晰档(0) + 换屏：仍 GC16+FULL（用户要"每步闪"就给闪） */
+    if (fb_wave_for(0, 0, 1, 1, 6, 0, &m) != WAVEFORM_MODE_GC16) ok = 0;
+    if (m != UPDATE_MODE_FULL) ok = 0;
+    /* 非 Regal 局部档(1) + 换屏：GC16+FULL（按 1.3.3 两分法，换屏仍全刷） */
+    if (fb_wave_for(1, 0, 1, 1, 6, 0, &m) != WAVEFORM_MODE_GC16) ok = 0;
+    /* 非 Regal 局部档(1) + 翻页：GC16+PARTIAL（不闪） */
+    if (fb_wave_for(1, 0, 0, 1, 6, 0, &m) != WAVEFORM_MODE_GC16) ok = 0;
+    if (m != UPDATE_MODE_PARTIAL) ok = 0;
+    /* 第4档：非整屏周期点 = PARTIAL；整屏周期点 = FULL */
+    if (fb_wave_for(3, 0, 0, 5, 6, 0, &m) != WAVEFORM_MODE_GC16) ok = 0;
+    if (m != UPDATE_MODE_PARTIAL) ok = 0;
+    if (fb_wave_for(3, 0, 0, 6, 6, 0, &m) != WAVEFORM_MODE_GC16) ok = 0;
+    if (m != UPDATE_MODE_FULL) ok = 0;
+    return ok;
+}
+
 void fb_present(Fb *fb, int full) {
     if (fb->eink_kind == 9) {
         sim_snapshot(fb);
@@ -878,39 +945,19 @@ void fb_present(Fb *fb, int full) {
         b[1] = 0;                             /* left */
         b[2] = (uint32_t)aw;                  /* width */
         b[3] = (uint32_t)fb->height;          /* height */
-        b[5] = (full || !fb->fast_mode) ? UPDATE_MODE_FULL : UPDATE_MODE_PARTIAL;
-
-        unsigned wave;
-        if (full || !fb->fast_mode) {
-            wave = WAVEFORM_MODE_GC16;
-        } else if (fb->fast_mode == 3 && fb->full_every > 1 &&
-                   fb->flip_count % fb->full_every == 0) {
-            /* 1.2.15 第 4 档：平时不闪（GC16 局部），每 full_every 次翻页
-             * 补一次 GC16 全刷，把攒起来的残影清掉。真机反馈：只有 Regal
-             * 一种"不闪"的选择不够——局部刷新快但残影会攒，全刷新干净
-             * 但每页都闪。折中：N 页一清。 */
-            wave = WAVEFORM_MODE_GC16;
-            b[5] = UPDATE_MODE_FULL;
-            if (fb->flip_count % (fb->full_every * 20) == fb->full_every)
-                logmsg("fb: 第4档 定期全刷（每 %d 次翻页）", fb->full_every);
-        } else if (fb->fast_mode == 2 || fb->regal) {
-            /* 1.2.9 Regal（实验）：REAGL=0x8，"残影补偿"波形。
-             * KOReader 在 PW2 上的用法是 REAGL + UPDATE_MODE_FULL：
-             * 翻页不闪白但驱动会做残影补偿，比 GC16 局部更新更干净。
-             * 被驱动拒绝（EINVAL）时自动退回 GC16 局部并关掉 Regal。 */
-            wave = WAVEFORM_MODE_REAGL;
-            b[5] = UPDATE_MODE_FULL;
-        } else if (fb->use_du) {
-            /* 只有手写 du=1 才走 A2/DU：快，但 DU 只翻像素不擦底，
-             * 连续几屏之后上一屏的字会留在纸上（真机照片里的"重叠"），
-             * 灰阶抗锯齿也被量化掉（"字发虚"）。每 8 次补一次 GC16。 */
-            wave = (fb->flip_count % 8 == 0) ? WAVEFORM_MODE_GC16 : WAVEFORM_MODE_DU;
-        } else {
-            /* 1.2.8 默认：GC16 + PARTIAL。不闪屏，但波形是"擦干净再写"，
-             * 不会像 DU 那样把上一屏留在纸上。 */
-            wave = WAVEFORM_MODE_GC16;
-        }
+        int out_mode = UPDATE_MODE_PARTIAL;
+        /* 1.3.4：波形统一走纯函数（自检共用）。Regal 现在覆盖 full=1，
+         * 主界面换屏/加载/消息框也不再 GC16 黑闪。 */
+        unsigned wave = fb_wave_for(fb->fast_mode, fb->regal, full,
+                                    fb->flip_count, fb->full_every, fb->use_du,
+                                    &out_mode);
+        b[5] = (uint32_t)out_mode;
         b[4] = wave;
+        /* 第4档定期全刷的日志（频率低，不刷屏） */
+        if (fb->fast_mode == 3 && !(fb->regal) && !full && fb->full_every > 1 &&
+            (fb->flip_count % fb->full_every == 0) &&
+            (fb->flip_count % (fb->full_every * 20) == fb->full_every))
+            logmsg("fb: 第4档 定期全刷（每 %d 次翻页）", fb->full_every);
         b[6] = fb->marker++;                  /* update_marker */
         b[7] = (uint32_t)fb->update_temp;     /* temp：探测时确认过的那档 */
 
@@ -930,13 +977,17 @@ void fb_present(Fb *fb, int full) {
             logmsg("fb: SEND_UPDATE 耗时 %ldms（full=%d wave=%u）——驱动排队了",
                    spent, full, wave);
 
-        if (r != 0 && !full && fb->fast_mode) {
+        /* 1.3.4：Regal 现在也用于 full=1（换屏）。整屏的 REAGL 若被固件拒绝，
+         * 同样要补一帧 GC16/FULL 并把 Regal 关掉，否则换屏会一直失败。
+         * 条件放宽为：快刷(full=0)失败，或本次用的是 Regal（不管 full）。 */
+        int is_regal = (fb->fast_mode == 2 || fb->regal);
+        if (r != 0 && fb->fast_mode && (!full || is_regal)) {
             /* 有的固件只认 GC16 + FULL，DU/REAGL/PARTIAL 直接 EINVAL。
              * 先补一帧全刷：能把画面推上去就先推上去。
              * Regal 被拒就永久关掉（fast_mode 退回 1=局部 GC16），并写日志。
              * 1.2.15：第 4 档（局部+定期全刷）不关——它平时用的就是最基本的
              * GC16/PARTIAL，被拒时本次已用全刷兜底，下翻页接着试局部。 */
-            int was_regal = (fb->fast_mode == 2);
+            int was_regal = is_regal;
             int was_4 = (fb->fast_mode == 3);
             b[4] = WAVEFORM_MODE_GC16;
             b[5] = UPDATE_MODE_FULL;
@@ -946,6 +997,7 @@ void fb_present(Fb *fb, int full) {
                 if (was_regal) {
                     logmsg("fb: Regal(REAGL) 被拒 errno=%d，改 GC16/FULL 成功，本次起关闭 Regal", e);
                     fb->fast_mode = 1;
+                    fb->regal = 0;   /* config 里 regal=1 强制位也要清，否则下次又开 */
                 } else if (was_4) {
                     logmsg("fb: 第4档局部刷新被拒 errno=%d，本次以全刷兜底（模式保留）", e);
                 } else {

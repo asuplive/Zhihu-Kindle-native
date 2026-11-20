@@ -918,6 +918,15 @@ static int run_selftest(void) {
         ok ? pass++ : fail++;
     }
 
+    /* [wav ]（1.3.4）：Regal 波形覆盖整屏刷新——修"主界面闪、阅读不闪" */
+    {
+        extern int fb_refresh_wave_test(void);
+        ok = fb_refresh_wave_test();
+        printf("[wav  ] %s Regal 覆盖翻页+换屏(full=1)：REAGL 不闪白，非 Regal 换屏仍全刷\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
     /* 1.2.9：排版首页高度——标题只占第一页，后续页整页都是正文。 */
     {
         char ferr[256] = "";

@@ -12,7 +12,7 @@
 
 ## 下载安装（不需要自己编译）
 
-最新版本 **1.2.9**，到 [Releases](https://github.com/asuplive/zhihu-kindle-native/releases/latest) 下载：
+最新版本 **1.3.4**，到 [Releases](https://github.com/asuplive/zhihu-kindle-native/releases/latest) 下载：
 
 | 文件 | 用途 |
 |---|---|
@@ -23,6 +23,8 @@
 
 **要求**：已越狱的 Kindle（推荐 Kindle Oasis 3，1264×1680；其他型号可自行按 `src/fb.h` 里的参数适配），已装 KUAL。
 
+> **1.3.4**：两项刷屏默认改 Regal + 修「主界面闪、阅读不闪」。① **默认 Regal**：翻页刷屏、主界面刷屏默认值 1→2，老设备用 `rglmig` 标记一次性迁移；② **根治主界面闪**：真机日志 `eink=1` 走 mxcfb，根因是 `fb_present()` 里 `full=1`（换屏/加载/消息框）被 `if(full)` 抢先命中 GC16 全刷黑闪，Regal 分支永远轮不到——阅读翻页 `full=0` 才用得到 Regal。把波形决策抽成 `fb_wave_for()` 纯函数、Regal 提到最高优先级覆盖 `full=1`（REAGL+FULL 整屏更新但不闪白），固件拒绝则补 GC16 全刷并关 Regal。新增 `[wav]` 自检，45 项全过。详见[变更说明-1.3.4.md](变更说明-1.3.4.md)。
+>
 > **1.3.3**：定稿两条。① **刷屏范围两分法**：问题/回答列表页 + 答案详情翻页归「翻页刷屏」，其余全部界面归「主界面刷屏」，新增 `mark_inplace_refresh()` 按界面自动路由，覆盖全部场景（修正 1.3.0 起列表翻页误归主界面刷屏的归类）；② **层级返回彻底修复**：热榜→问题回答列表→返回回热榜——根因是 `list_push_parent` 的 `g.scr==SCR_LIST` 守卫，网络任务把 scr 改成 LOADING/MESSAGE 后守卫拒绝压栈（1.2.13~1.3.2 三版连栽）；现删掉该守卫，只按 `g.list` 有效性压栈，与状态机彻底解耦。新增 `[ref]` 自检 + `hotans` 端到端注入。详见[变更说明-1.3.3.md](变更说明-1.3.3.md)。
 
 > **1.3.2**：1.3.1 修「回答列表返回直接回主页」**没修干净**——恢复用的 `scr_prev` 是「上一次弹消息前的界面」（过期值，常为主页），守卫照样拒绝压栈。改为 `loading_scr_enter()` 在进加载页那一刻把真实来源界面记进 `load_scr_prev`，恢复用它；`[nav]` 自检重写为真实链路（enter→restore→push），`list_push_parent` 加日志（run.log 一眼定位层级断链）。详见[变更说明-1.3.2.md](变更说明-1.3.2.md)。

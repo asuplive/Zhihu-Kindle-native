@@ -124,8 +124,20 @@ void fb_blit_gray(Fb *fb, int x, int y, int w, int h, const uint8_t *alpha, int 
 void fb_blit_gray_scaled(Fb *fb, int x, int y, int w, int h,
                          const uint8_t *src, int sw, int sh);
 
-/* 提交到屏幕。full=1 用 GC16 全刷（清残影），0 用快速波形 */
+/* 提交到屏幕。full=1 整屏更新（清残影），0 屏内快速更新 */
 void fb_present(Fb *fb, int full);
+
+/* 1.3.4：波形决策纯函数——fb_present 与自检共用同一份逻辑。
+ * 返回 WAVEFORM_MODE_*；*out_mode 回写 UPDATE_MODE_FULL / PARTIAL。
+ * 关键规则（修复"主界面闪、阅读不闪"）：
+ *   Regal(fast_mode==2 或 regal=1) 覆盖**所有**刷新，包括整屏换内容(full=1)——
+ *   REAGL+UPDATE_MODE_FULL 是 Kindle 标准"整屏更新但不闪白"波形：既是全刷
+ *   （驱动做残影补偿、不叠屏）又黑闪最小。1.3.3 及以前 Regal 分支排在
+ *   `if(full)` 之后，full=1 时永远走 GC16 全刷，所以设了 Regal 主界面照闪。 */
+unsigned int fb_wave_for(int fast_mode, int regal, int full, int flip_count,
+                         int full_every, int use_du, int *out_mode);
+/* 自检：钉死上面的波形规则（无需真机） */
+int fb_refresh_wave_test(void);
 
 /* ---- 屏幕归属守护 ----
  * 1.2.4 起默认不再停掉 framework，cvm 一直活着。它可能在自己有事的时候

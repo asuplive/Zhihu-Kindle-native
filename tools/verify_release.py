@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.3.3"
+VER = "1.3.4"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -328,6 +328,16 @@ def main():
           "ui.c 1.3.3：刷屏两分法——列表/答案详情→翻页刷屏，其余→主界面刷屏（[ref] 自检）")
     check("[ref  ]" in mnc and "刷屏两分法" in mnc,
           "main.c [ref] 自检覆盖刷屏两分法全部界面")
+    # 1.3.4：默认 Regal + 修主界面闪（Regal 覆盖 full=1）
+    check("static Config g_cfg = { 1, 2, 0, 0, 7" in uic and
+          "g_cfg.uifast = 2" in uic and "strcmp(k, \"rglmig\")" in uic,
+          "ui.c 1.3.4：翻页/主界面刷屏默认 Regal(2)，老设备 rglmig 一次性迁移")
+    check("unsigned int fb_wave_for(int fast_mode, int regal, int full" in fbc and
+          "if (fast_mode == 2 || regal) {" in fbc and
+          "UPDATE_MODE_FULL;\n        return WAVEFORM_MODE_REAGL;" in fbc,
+          "fb.c 1.3.4：Regal 提到波形决策最高优先级，覆盖 full=1 换屏不黑闪")
+    check("int fb_refresh_wave_test(void)" in fbc and "[wav  ]" in mnc,
+          "fb.c/main.c 1.3.4：[wav] 自检钉死 Regal 覆盖翻页+换屏波形规则")
     check("g.scr = SCR_READER;" in uic and
           "成功路径如果不换回来" in uic,
           "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")
@@ -389,7 +399,9 @@ def main():
           "UA_APP" in z.read(base + "source/src/api.c").decode("utf-8", "replace"),
           "api.c App 通道：api.zhihu.com 用 App UA + x-api-version，不发 web 签名（真机登录态 500 的修复）")
     fbc = z.read(base + "source/src/fb.c").decode("utf-8", "replace")
-    check('fast_mode == 3 && fb->full_every > 1' in fbc and "fullevery=" in fbc,
+    # 1.3.4：第4档周期逻辑移入 fb_wave_for 纯函数（去掉 fb-> 前缀）
+    check(('fast_mode == 3 && full_every > 1' in fbc or
+           'fast_mode == 3 && fb->full_every > 1' in fbc) and "fullevery=" in fbc,
           "fb.c 第 4 档：每 full_every 次翻页补一次 GC16 全刷，周期可配（2..20）")
     check("was_4" in fbc,
           "fb.c 第 4 档被驱动拒绝时模式保留（不永久关闭）")
