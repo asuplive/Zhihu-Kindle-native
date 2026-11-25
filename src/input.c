@@ -100,6 +100,8 @@ static int parse_sim_line(const char *line, Ev *e) {
     else if (strcmp(cmd, "ime") == 0)    { e->type = ZH_KEY;     e->code = 990; }
     else if (strcmp(cmd, "anslist") == 0){ e->type = ZH_KEY;     e->code = 992; }
     else if (strcmp(cmd, "hotans") == 0) { e->type = ZH_KEY;     e->code = 989; }
+    else if (strcmp(cmd, "nextans") == 0){ e->type = ZH_KEY;     e->code = 988; }
+    else if (strcmp(cmd, "redraw") == 0) { e->type = ZH_KEY;     e->code = 987; }
     else return 0;
     return 1;
 }

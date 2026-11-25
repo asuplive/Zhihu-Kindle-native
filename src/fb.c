@@ -925,10 +925,22 @@ int fb_refresh_wave_test(void) {
     return ok;
 }
 
+/* 1.3.8：自检用的调用计数。只为了让 [idle] 项能证明"挂起恢复不刷屏"：
+ * 以前 fb_after_resume 内部会 fb_present(1)，现在只 unblank。 */
+static int fb_present_calls_dbg;
+
 void fb_present(Fb *fb, int full) {
+    fb_present_calls_dbg++;
     if (fb->eink_kind == 9) {
         sim_snapshot(fb);
         return;
+    }
+    /* 1.3.8：把挂起期间欠下的 unblank 在这里补上（懒恢复）。
+     * 静止时不执行，只有真正要刷新时才做一次，避免"不操作也闪"。 */
+    if (fb->resume_pending) {
+        fb->resume_pending = 0;
+        if (fb->fd >= 0) ioctl(fb->fd, FBIOBLANK, FB_BLANK_UNBLANK);
+        fb_trace(fb, "resume: 补 unblank 后提交");
     }
     msync(fb->mem, fb->memlen, MS_ASYNC);
 
@@ -1174,7 +1186,60 @@ void fb_after_resume(Fb *fb) {
     if (fb->fd >= 0) ioctl(fb->fd, FBIOBLANK, FB_BLANK_UNBLANK);
     /* 挂起期间 eips 可能被杀、驱动状态也可能丢，失败计数清零重来 */
     fb->eips_fail = 0;
-    fb_present(fb, 1);
+    fb->resume_pending = 0;
+    /* 1.3.8：**不再 fb_present(1)**。
+     * 电子墨水是双稳态的，挂起不会丢画面；原来每次唤醒都整屏刷一次，
+     * 在真机上就是"放着不动、每隔一阵屏幕自己闪一下"。真正丢状态时
+     * 由屏幕守护（fb_guard 逐字节比对）发现并回灌，比无条件全刷精确。 */
+}
+
+void fb_mark_resume(Fb *fb) {
+    /* 挂起是真的（/proc/uptime 与单调时钟差了一截），但此刻什么都不做：
+     * 不 unblank、不写像素、不发 ioctl。标记留到下一次真正要刷屏时消化，
+     * 这样"界面不动"期间一个刷新动作都不会有。 */
+    fb->resume_pending = 1;
+    fb->eips_fail = 0;
+
+    /* 1.3.8：静默回灌内存（不刷屏）。
+     * 有的机型 suspend/resume 会让 EPDC 把 framebuffer 内存清掉或改写，
+     * 若不处理，屏幕守护会在恢复后第一次比对时判"像素被改"→ 整屏回灌 →
+     * 又变成"不动也闪"。而电子墨水是双稳态的：内存被清，纸上那层墨没变。
+     * 所以这里只把影子副本 memcpy 回内存，让内存与屏幕重新一致；不发任何
+     * 刷新，用户完全看不到动作。下次翻页正常全刷时自然同步。 */
+    if (fb->shadow && fb->shadow_len && fb->mem &&
+        fb->base_off + fb->shadow_len <= fb->memlen)
+        memcpy(fb->mem + fb->base_off, fb->shadow, fb->shadow_len);
+}
+
+/* 自检：钉死"挂起恢复不刷屏 + 懒消费"这条语义。
+ * 不需要真机：用一个不打开设备的 Fb 结构走同一份代码路径，
+ * 再用 fb_present 的调用计数证明 fb_after_resume 没有偷偷提交一帧。 */
+int fb_resume_lazy_test(void) {
+    static uint8_t scratch[4096];
+    Fb t;
+    memset(&t, 0, sizeof(t));
+    t.fd = -1;
+    t.eink_kind = 3;              /* 只写内存档：present 不会碰任何 ioctl */
+    t.mem = scratch;
+    t.memlen = sizeof(scratch);
+    t.width = 32; t.height = 32; t.line_len = 32;
+
+    int before = fb_present_calls_dbg;
+    fb_mark_resume(&t);
+    if (t.resume_pending != 1) return 0;      /* 打上标记 */
+    fb_mark_resume(&t);
+    if (t.resume_pending != 1) return 0;      /* 幂等 */
+
+    fb_after_resume(&t);
+    if (t.resume_pending != 0) return 0;      /* 立即恢复=清标记 */
+    if (fb_present_calls_dbg != before) return 0;  /* 关键：恢复接口不得刷屏 */
+
+    /* 懒消费：标记在下一次真正的 present 里被吃掉 */
+    fb_mark_resume(&t);
+    fb_present(&t, 0);
+    if (t.resume_pending != 0) return 0;
+    if (fb_present_calls_dbg != before + 1) return 0;
+    return 1;
 }
 
 int fb_poll_rotate(Fb *fb) {

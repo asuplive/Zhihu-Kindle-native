@@ -98,6 +98,10 @@ typedef struct {
      * 把我们的画面盖掉一部分。1.2.4 的做法是"发现被改就重新排版重画"，
      * 一次要几十毫秒、而且中间还会再空一帧；有了影子副本就可以
      * 直接把整页 memcpy 回去（约 2ms）+ 一次全刷，桌面残留几乎看不见。 */
+    /* 1.3.8：挂起后待补的 unblank。见 fb_mark_resume。不占额外内存，
+     * 也不会自己触发刷新——只在下一次 fb_present 里消化掉。 */
+    int resume_pending;
+
     uint8_t *shadow;
     size_t   shadow_len;
 } Fb;
@@ -156,9 +160,19 @@ int  fb_shadow_enable(Fb *fb);
 /* 把影子副本整页写回可见页并全刷一次。返回 0 成功。-1 表示没有影子副本。 */
 int  fb_restore(Fb *fb);
 
-/* 设备从挂起回来后调一次：EPDC 会丢状态，不 unblank 的话屏幕是黑的。
+/* 设备从挂起回来后调一次：只 unblank，**不刷屏**。
+ * 1.3.8：这里原来还会 fb_present(1) 整屏刷一次，于是 Kindle 空闲时每个
+ * 挂起/唤醒周期都黑闪一下——用户看到的就是"界面不动也时不时自动刷新"，
+ * 而电子墨水断电保持画面，挂起并不会让屏幕内容丢失，这次全刷纯属多余。
  * ui.c 的心跳检测到 /proc/uptime 比单调时钟多跑了一截就调它。 */
 void fb_after_resume(Fb *fb);
+
+/* 1.3.8：挂起恢复的"懒处理"。心跳只打这个标记（零 ioctl、零像素写入），
+ * 等下一次真的要刷屏时由 fb_present 先 unblank 再提交。
+ * 目的：静止时彻底不碰屏幕——不动就不刷，连 EPDC 的 unblank 都不做。 */
+void fb_mark_resume(Fb *fb);
+/* 自检：挂起恢复不刷屏 + 懒消费的语义（无需真机） */
+int  fb_resume_lazy_test(void);
 
 /* 1.2.9：读一次 var.rotate，检测系统是否旋转了屏幕（KO3 设备翻转时
  * framework 会转显示方向）。返回 1=旋转变了（fb->hw_rotate 已更新，

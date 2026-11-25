@@ -913,7 +913,7 @@ static int run_selftest(void) {
     {
         extern int ui_refresh_route_test(void);
         ok = ui_refresh_route_test();
-        printf("[ref  ] %s 刷屏两分法：列表/答案详情→翻页刷屏，其余→主界面刷屏\n",
+        printf("[ref  ] %s 屏内刷新分类：列表/答案详情/其余界面各自标记（1.3.7 统一走刷新模式档）\n",
                ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
     }
@@ -923,6 +923,34 @@ static int run_selftest(void) {
         extern int fb_refresh_wave_test(void);
         ok = fb_refresh_wave_test();
         printf("[wav  ] %s Regal 覆盖翻页+换屏(full=1)：REAGL 不闪白，非 Regal 换屏仍全刷\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
+    /* [nxt ]（1.3.5）：末页「下一个回答」判据——末页+有下一条才切，私信页不误切 */
+    {
+        extern int ui_next_answer_test(void);
+        ok = ui_next_answer_test();
+        printf("[nxt  ] %s 末页下一回答：末页+有下一条才切，非末页/最后一条/私信页不误触\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
+    /* [diff ]（1.3.6）：提交去重判据——画面没变不刷、变了/强制/无基准才刷 */
+    {
+        extern int ui_present_diff_test(void);
+        ok = ui_present_diff_test();
+        printf("[diff ] %s 提交去重：内容未变跳过，变化/强制/首帧必刷\n",
+               ok ? "OK" : "FAIL");
+        ok ? pass++ : fail++;
+    }
+
+    /* [idle ]（1.3.8）：挂起恢复必须"懒处理"——只打标记，不 unblank、不刷屏。
+     * 这是"界面不动也时不时自动刷新"的根因闸门：以前唤醒即整屏刷一次。 */
+    {
+        extern int fb_resume_lazy_test(void);
+        ok = fb_resume_lazy_test();
+        printf("[idle ] %s 静止不动零刷新：挂起只打标记，恢复延到下次真要刷屏时\n",
                ok ? "OK" : "FAIL");
         ok ? pass++ : fail++;
     }

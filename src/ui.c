@@ -126,6 +126,10 @@ static void config_load(void) {
     if (g_cfg.fullevery < 2 || g_cfg.fullevery > 20) g_cfg.fullevery = 6;
     /* 1.3.0：主界面刷屏同四档；1.3.4 默认改 Regal(2)，非法值回 2 */
     if (g_cfg.uifast < 0 || g_cfg.uifast > 3) g_cfg.uifast = 2;
+    /* 1.3.7：两项合并为单一「刷新模式」，以 fast 为准。老 config 里
+     * fast/uifast 可能不同（两个独立设置时代的残留），这里强制同源，
+     * 保证两分法两条路径都走同一档。 */
+    g_cfg.uifast = g_cfg.fast;
     /* 推荐条数只认 6/12/18 */
     if (g_cfg.rec != 6 && g_cfg.rec != 12 && g_cfg.rec != 18) g_cfg.rec = 6;
     g_cfg.showbar = g_cfg.showbar ? 1 : 0;
@@ -244,9 +248,11 @@ int ui_config_roundtrip_test(void) {
 
     g_cfg.refresh[0] = 0;
     config_load();
+    /* 1.3.7：fast/uifast 合并同源——种子里旧值 fast=0/uifast=3，
+     * 载入后应统一成 fast=0（以 fast 为准）。images 三档不被夹成 1。 */
     int loaded = (strcmp(g_cfg.refresh, "pan") == 0) && g_cfg.size == 2 &&
-                 g_cfg.images == 2 && g_cfg.fast == 0 && g_cfg.uifast == 3 &&
-                 g_cfg.rglmig == 1;   /* 1.3.4：带迁移标记时不被改写；images 三档不被夹成 1 */
+                 g_cfg.images == 2 && g_cfg.fast == 0 && g_cfg.uifast == g_cfg.fast &&
+                 g_cfg.rglmig == 1;
 
     config_save();
     size_t n = 0;
@@ -398,6 +404,16 @@ typedef struct {
     /* 屏幕归属守护（1.2.4）：默认与 framework 共存，cvm 可能随时把
      * 我们画好的这页盖掉。screen_sig 是"我们最后一帧的采样哈希"。 */
     uint32_t   screen_sig;
+    /* 1.3.6：提交去重——只有画面内容真的变了才发刷新 ioctl。
+     * present_sig/present_valid 是"上次成功提交时的画面签名"基准；
+     * present_force 是一次性强制标志（唤醒/守护后屏幕实际显示可能已丢失，
+     * 即使像素没变也必须补一帧），提交一次后自动清掉。
+     * present_skips/present_tries 只用于心跳日志观测去重效果。 */
+    uint32_t   present_sig;
+    int        present_valid;
+    int        present_force;
+    long       present_skips;
+    long       present_tries;
     long       guard_ms;
     long       guard_first;    /* 第一次被抢屏的时刻（判断"持续抢"） */
     int        stop_req;       /* （1.2.10 已废弃）曾经请求过停止系统界面 */
@@ -405,6 +421,11 @@ typedef struct {
     long       msg_until;     /* 自动关闭的提示（触摸可能不通时不能弹模态） */       /* 补抢触摸独占的节流 */
     int        guard_hits;    /* 屏幕被抢过几次 */
     long       idle_since;    /* 最近一次有事件的时间，用来判断触摸是不是死了 */
+    /* 1.3.8：静止期刷新审计。last_input_ms 只由真实输入事件刷新；
+     * idle_presents 统计"无操作 3 秒之后仍发生的提交"次数。
+     * 心跳里能看到它涨没涨——这是"不动到底刷没刷"的硬证据。 */
+    long       last_input_ms;
+    long       idle_presents;
 
     /* 1.2.8：只让"翻一页"走局部刷新。换屏（首页↔列表↔阅读↔设置…）
      * 一律全刷，否则上一屏的字会留在纸上（真机照片里的"重叠"）。 */
@@ -443,6 +464,10 @@ static void draw_reader(void);
 static void draw_dm_read(void);
 static void draw_dm_list(void);
 static int  reader_top_n(void);
+/* 1.3.5：末页「下一个回答」判据（draw_reader 在定义之前就要用） */
+static int  reader_at_last_page(void);
+static int  reader_has_next_answer(void);
+static int  reader_can_go_next_answer(void);
 static void draw_account(void);
 static void draw_qrcode(void);
 static void draw_settings(void);
@@ -517,7 +542,7 @@ static void draw_header(const char *title, const char *right) {
  * 限制在正文区，避免想翻页却退回列表。 */
 typedef struct { int x, y, w, h; } Rect;
 
-enum { BTN_NONE = 0, BTN_BACK, BTN_PREV, BTN_NEXT, BTN_REFRESH };
+enum { BTN_NONE = 0, BTN_BACK, BTN_PREV, BTN_NEXT, BTN_REFRESH, BTN_NEXTANSWER };
 
 static Rect g_fb_btn[4];
 static int  g_fb_id[4];
@@ -541,6 +566,33 @@ static Rect footer_btn(int id, const char *label) {
     int x = g.W - g.margin - w;
     for (int i = 0; i < g_fb_n; i++) x -= g_fb_btn[i].w + g.base / 3;
     if (x < g.margin / 2) x = g.margin / 2;
+    r.x = x; r.y = y; r.w = w; r.h = h;
+
+    fb_fill(&g.fb, x, y, w, h, 255);
+    fb_hline(&g.fb, x, y, w, 60);
+    fb_hline(&g.fb, x, y + h - 1, w, 60);
+    fb_vline(&g.fb, x, y, h, 60);
+    fb_vline(&g.fb, x + w - 1, y, h, 60);
+    text_at(x + (w - tw) / 2, y + (h + px) / 2 - px / 6, px, label, 0, 0);
+
+    g_fb_btn[g_fb_n] = r;
+    g_fb_id[g_fb_n] = id;
+    g_fb_n++;
+    return r;
+}
+
+/* 1.3.5：居中按钮（阅读页末页「下一个回答」）。与从右往左排的 footer_btn
+ * 不同，这个固定在页脚正中；两者共用同一套边框/命中表，可同时存在。 */
+static Rect footer_btn_center(int id, const char *label) {
+    Rect r = { 0, 0, 0, 0 };
+    if (g_fb_n >= 4 || !label || !*label) return r;
+    int px = g.base * 3 / 5;
+    int tw = font_width(px, label, (int)strlen(label));
+    int w = tw + g.base * 3 / 2;
+    int h = g.footer_h - 8;
+    if (h < g.base) h = g.base;
+    int y = g.H - g.footer_h + (g.footer_h - h) / 2;
+    int x = (g.W - w) / 2;              /* 正中 */
     r.x = x; r.y = y; r.w = w; r.h = h;
 
     fb_fill(&g.fb, x, y, w, h, 255);
@@ -594,22 +646,65 @@ static int footer_hit(int x, int y) {
  *   present_fast —— 阅读页翻页专用（同上，但不受 fast 开关影响前先判一次）。
  * 1.2.3 的毛病是全都用 present_full：点一下菜单就整屏黑闪一次，一秒钟才回来，
  * 用户感受就是"卡"。电子墨水本来就慢，能省的那一次闪一定要省。 */
+/* 1.3.6：提交去重的核心判据——画面内容没变就别碰 ioctl。
+ * 电子墨水的每次 SEND_UPDATE 都要重新驱动整屏，哪怕像素一模一样也会有
+ * 微闪/残影累积。以前 draw_* 末尾无条件 present_screen()，于是：
+ *   - 重复点同一项、末页再按"下一页"（reader_goto 里 return 了，但有的
+ *     路径会先 draw 一遍）、图未到货的 img_tick 重画、旋转时的二次 present
+ *   都会白刷一次。这里在提交前采样 framebuffer 签名，和上次成功提交时
+ *   的签名比：相同 → 跳过；不同 → 提交并更新基准。
+ * force=1 用于"屏幕实际显示可能已丢失"的场景（唤醒/守护回灌后），
+ * 那种情况下像素没变也必须补一帧把画面推上去。
+ * 抽成纯函数供自检（真机/自检共用同一份判据）。 */
+static int present_needed(uint32_t last, int valid, uint32_t now, int force) {
+    if (force || !valid) return 1;   /* 强制，或还没有基准（首帧必刷） */
+    return last != now;
+}
+/* 自检：钉死去重判据 */
+int ui_present_diff_test(void) {
+    int ok = 1;
+    if (!present_needed(0, 0, 0, 0)) ok = 0;          /* 无基准 → 必刷 */
+    if (present_needed(100, 1, 100, 0)) ok = 0;        /* 内容没变 → 跳过 */
+    if (!present_needed(100, 1, 101, 0)) ok = 0;       /* 内容变了 → 刷 */
+    if (!present_needed(100, 1, 100, 1)) ok = 0;       /* 强制 → 必刷 */
+    return ok;
+}
+
+/* 采样当前画面并按需提交；返回 1=真的刷了 0=跳过（内容没变） */
+static int commit_if_changed(int full) {
+    uint32_t now = fb_sample_sig(&g.fb);
+    g.present_tries++;
+    if (!present_needed(g.present_sig, g.present_valid, now, g.present_force)) {
+        g.present_skips++;
+        g.present_force = 0;   /* 强制位一次性 */
+        return 0;
+    }
+    g.present_force = 0;
+    fb_present(&g.fb, full);
+    g.present_sig = fb_sample_sig(&g.fb);
+    g.present_valid = 1;
+    g.screen_sig = g.present_sig;   /* 守护基准与提交基准保持同步 */
+    /* 1.3.8：无操作 3 秒后还发生的提交记一笔。正常只应该来自
+     * "内容真的变了"（图片到货、网络返回、守护回灌）；
+     * 如果它跟着时间稳定增长而界面上什么都没变，就是新的自动刷新源。 */
+    if (g.last_input_ms && now_ms_ui() - g.last_input_ms > 3000)
+        g.idle_presents++;
+    return 1;
+}
+
 static void present_full(void) {
     g.fast_next = 0;
-    fb_present(&g.fb, 1);
-    g.screen_sig = fb_sample_sig(&g.fb);
+    commit_if_changed(1);
 }
 static void present_fast(void) {
-    fb_present(&g.fb, 0);
-    g.screen_sig = fb_sample_sig(&g.fb);
+    commit_if_changed(0);
 }
-/* 1.3.3 定稿（第1条）：屏内刷新的归属判定，覆盖 App 内全部刷屏场景。
- *   翻页刷屏（g_cfg.fast）：问题/回答列表页（SCR_LIST）+ 答案详情浏览翻页
- *                          （SCR_READER）
- *   主界面刷屏（g_cfg.uifast）：其余全部界面（首页/设置/私信会话与消息/
- *                              账号/关于…）——SCR_DMREAD 私信消息归此类。
- * 调用方只需声明"这是一次屏内刷新"，具体归哪个设置档由当前界面自动决定，
- * 两分法不重不漏。换屏（draw 前未打标记）仍走全刷，防叠屏。 */
+/* 1.3.3 定稿的刷屏归属判定，覆盖 App 内全部屏内刷新场景：
+ *   fast_next  —— 问题/回答列表页（SCR_LIST）+ 答案详情翻页（SCR_READER）
+ *   ui_fast_next —— 其余界面（首页/设置/私信/账号/关于…）
+ * 1.3.7：两项设置合并为单一「刷新模式」，两个标记只是区分"翻页还是屏内"，
+ * 最终都取同一个 g_cfg.fast 档位，不再各读一个值。标记的两分法保留，
+ * 是因为它还能区分"换屏（无标记→全刷）"与"屏内更新（有标记→按档位）"。 */
 static void mark_inplace_refresh(void) {
     if (g.scr == SCR_LIST || g.scr == SCR_READER)
         g.fast_next = 1;
@@ -618,26 +713,22 @@ static void mark_inplace_refresh(void) {
 }
 /* 换屏专用：整屏换内容一律走全刷（GC16 / eips -f -g），否则上一屏的字会
  * 留在纸上——这就是真机照片里"每个界面都重叠"的根。只有明确标记了
- * "这一屏只是翻一页"（g.fast_next）才允许走局部更新。 */
+ * "这一屏只是翻一页/屏内更新"才允许走局部更新。1.3.7 起两路同档。 */
 static void present_screen(void) {
     if (g.fast_next && g_cfg.fast) {
-        /* 阅读页翻页：跟随「翻页刷屏」四档（fast_mode 在 fb_present 里
-         * 决定波形，第 4 档的周期性全刷也在里面记账） */
         g.fast_next = 0;
         g.fb.fast_mode = g_cfg.fast;
         present_fast();
         return;
     }
     if (g.ui_fast_next) {
-        /* 1.3.0：主界面屏内更新（选中移动/列表翻页）：跟随「主界面刷屏」四档。
-         * 第 4 档与阅读页共用 fullevery 周期和 fb 的翻页计数。 */
         g.ui_fast_next = 0;
-        if (g_cfg.uifast == 0) {
+        if (g_cfg.fast == 0) {   /* 1.3.7：与主界面共用同一档 */
             g.fast_next = 0;
             present_full();
             return;
         }
-        g.fb.fast_mode = g_cfg.uifast;
+        g.fb.fast_mode = g_cfg.fast;
         present_fast();
         return;
     }
@@ -1198,6 +1289,9 @@ static void draw_reader(void) {
     }
     footer_begin();
     footer_btn(BTN_BACK, "返回");
+    /* 1.3.5：末页正中「下一个回答」按钮——右上是返回，正中是下一个，
+     * 两者不重叠。footer_end 的左文字会自动躲开所有按钮。 */
+    if (reader_can_go_next_answer()) footer_btn_center(BTN_NEXTANSWER, "下一个");
     footer_end(left);
     /* 阅读页翻页同样尊重「快刷/清晰」设置：设成清晰就别用 DU，
      * 否则用户会觉得"设置了没用" */
@@ -1216,6 +1310,31 @@ static void reader_goto(int page) {
     draw_reader();
 }
 
+/* ---------------- 1.3.5：末页「下一个回答」 ----------------
+ * 从热榜/推荐/搜索/收藏列表点开答案后，g.list / g.list_sel 原样保留，
+ * g.list_sel 就是当前正在读的那一条；下一条 = g.list.v[g.list_sel+1]。
+ * 只在「答案阅读页 SCR_READER」判断——私信页 SCR_DMREAD 复用 draw_reader，
+ * 但那时 g.list 是残留的旧列表，必须排除（scr_prev 会被 show_message 改写，
+ * 不能当判据）。 */
+static int reader_at_last_page(void) {
+    return g.lay.pages && g.lay.npages > 0 && g.page >= g.lay.npages - 1;
+}
+
+static int reader_has_next_answer(void) {
+    if (g.scr != SCR_READER) return 0;
+    if (!g.list.v || g.list.n <= 0) return 0;
+    if (g.list_sel < 0 || g.list_sel + 1 >= g.list.n) return 0;
+    return 1;
+}
+
+/* 末页且确有下一条：按钮显示 + 右侧/下页键/左滑的切换判据，三处共用同一函数 */
+static int reader_can_go_next_answer(void) {
+    return reader_at_last_page() && reader_has_next_answer();
+}
+
+/* 实现放在 act_open_item 之后（它要复用 act_open_item 打开下一条） */
+static void reader_next_answer(void);
+
 /* ---------------- 屏幕：设置 ---------------- */
 
 static int set_row_h(void) { return g.base * 12 / 5; }
@@ -1225,42 +1344,43 @@ static void draw_settings(void) {
     draw_header("设置", NULL);
 
     static const char *names[] = {
-        "正文字号", "翻页刷屏", "主界面刷屏", "界面旋转", "显示图片", "页边距",
+        /* 1.3.7：原「翻页刷屏」+「主界面刷屏」合并为单一「刷新模式」。
+         * 四档语义不变（0 全部刷新 / 1 局部 / 2 Regal / 3 局部+定期全刷），
+         * 翻页与主界面屏内更新共用同一档，切换时 fast/uifast 一起写。
+         * 列表从 12 项减为 11 项，下面所有索引随之前移一位。 */
+        "正文字号", "刷新模式", "界面旋转", "显示图片", "页边距",
         "推荐条数", "列表样式", "系统状态栏", "重新排版", "清空缓存", "返回首页",
     };
-    char vals[12][64];
+    char vals[11][64];
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.size == 0 ? "小" : (g_cfg.size == 1 ? "中" : "大"));
     /* 1.2.8：fast 不再等于"用 DU 波形"（那是残影和字发虚的根），
      * 而是"翻页要不要整屏闪一下"。默认不闪（局部 + GC16），画面本身是干净的。
      * 1.2.9 新增第三档 Regal（REAGL 残影补偿波形，实验）。
      * 1.2.15 新增第四档：局部 N 次 + 一次全刷（真机反馈：只闪/不闪/Regal
-     * 不够用——局部快但残影攒、全刷干净但每页闪，折中 N 页一清）。 */
+     * 不够用——局部快但残影攒、全刷干净但每页闪，折中 N 页一清）。
+     * 1.3.4 默认 Regal(2)；1.3.7 两项合并后仍以 fast 为准。 */
     snprintf(vals[1], sizeof(vals[1]), "%s",
              g_cfg.fast == 2 ? "Regal（不闪+补偿）" :
              g_cfg.fast == 3 ? "局部+定期全刷" :
              (g_cfg.fast ? "局部刷新（不闪）" : "全部刷新（每页闪）"));
-    /* 1.3.0：主界面刷屏四档，语义与翻页刷屏一致，管首页/列表/设置的屏内更新 */
-    snprintf(vals[2], sizeof(vals[2]), "%s",
-             g_cfg.uifast == 2 ? "Regal（不闪+补偿）" :
-             g_cfg.uifast == 3 ? "局部+定期全刷" :
-             (g_cfg.uifast ? "局部刷新（不闪）" : "全部刷新（每步闪）"));
-    snprintf(vals[3], sizeof(vals[3]), "%d°", g_cfg.rotate * 90);
+    snprintf(vals[2], sizeof(vals[2]), "%d°", g_cfg.rotate * 90);
     static const char *imgmodes[] = { "关闭", "点按加载", "自动加载" };
     if (g_cfg.images < 0 || g_cfg.images > 2) g_cfg.images = 0;
-    snprintf(vals[4], sizeof(vals[4]), "%s", imgmodes[g_cfg.images]);
-    snprintf(vals[5], sizeof(vals[5]), "%d%%", g_cfg.margin_pct);
-    snprintf(vals[6], sizeof(vals[6]), "%d 条", g_cfg.rec);
+    snprintf(vals[3], sizeof(vals[3]), "%s", imgmodes[g_cfg.images]);
+    snprintf(vals[4], sizeof(vals[4]), "%d%%", g_cfg.margin_pct);
+    snprintf(vals[5], sizeof(vals[5]), "%d 条", g_cfg.rec);
     /* 1.2.12：推荐/回答列表两种布局 */
-    snprintf(vals[7], sizeof(vals[7]), "%s",
+    snprintf(vals[6], sizeof(vals[6]), "%s",
              g_cfg.liststyle ? "详细（标题+摘要）" : "简洁（标题行高小）");
-    snprintf(vals[8], sizeof(vals[8]), "%s", g_cfg.showbar ? "显示" : "隐藏（推荐）");
-    snprintf(vals[9], sizeof(vals[9]), "重新分页");
-    snprintf(vals[10], sizeof(vals[10]), "含图片缓存");
-    vals[11][0] = 0;
+    snprintf(vals[7], sizeof(vals[7]), "%s", g_cfg.showbar ? "显示" : "隐藏（推荐）");
+    snprintf(vals[8], sizeof(vals[8]), "重新分页");
+    snprintf(vals[9], sizeof(vals[9]), "含图片缓存");
+    vals[10][0] = 0;
 
     int rh = set_row_h();
     int y = g.header_h;
-    for (int i = 0; i < 12; i++) {
+    int nrow = (int)(sizeof(names) / sizeof(names[0]));   /* 1.3.7：11 项，删了重复刷屏项 */
+    for (int i = 0; i < nrow; i++) {
         if (i == g.list_sel) {
             fb_fill(&g.fb, 0, y, g.W, rh, 0);
         }
@@ -2250,6 +2370,52 @@ int ui_refresh_route_test(void) {
     return ok;
 }
 
+/* 1.3.5 自检：末页「下一个回答」的判据。只测纯判断逻辑（切下一个会触发
+ * 网络，不在这里跑）。钉死三条：末页+有下一条才切、非末页/最后一条不切、
+ * 私信页 SCR_DMREAD 绝不误切（它复用 draw_reader，最容易被带偏）。 */
+int ui_next_answer_test(void) {
+    int ok = 1;
+    int scr0 = g.scr, sel0 = g.list_sel, page0 = g.page;
+    ApiList list0 = g.list;
+    Layout lay0 = g.lay;
+
+    ApiItem items[3];
+    memset(items, 0, sizeof(items));
+    int pages[3] = { 0, 10, 20 };
+    g.list.v = items; g.list.n = 3; g.list.cap = 3;
+    g.lay.pages = pages; g.lay.npages = 2;
+
+    /* 1) 末页 + 还有下一条 → 三判据全真 */
+    g.scr = SCR_READER; g.list_sel = 0; g.page = 1;
+    ok = ok && reader_at_last_page() && reader_has_next_answer() && reader_can_go_next_answer();
+
+    /* 2) 非末页 → 不切（走普通翻页） */
+    g.page = 0;
+    ok = ok && !reader_at_last_page() && !reader_can_go_next_answer();
+
+    /* 3) 已经是最后一条 → 无下一条 */
+    g.page = 1; g.list_sel = 2;
+    ok = ok && reader_at_last_page() && !reader_has_next_answer() && !reader_can_go_next_answer();
+
+    /* 4) 私信阅读页：复用 draw_reader 但 scr!=SCR_READER，绝不误切（关键回归） */
+    g.scr = SCR_DMREAD; g.list_sel = 0; g.page = 1;
+    ok = ok && !reader_has_next_answer() && !reader_can_go_next_answer();
+
+    /* 5) 空列表 / 非法索引 */
+    g.scr = SCR_READER; g.list.n = 0; g.list.v = NULL;
+    ok = ok && !reader_has_next_answer();
+    g.list.v = items; g.list.n = 3; g.list_sel = -1;
+    ok = ok && !reader_has_next_answer();
+
+    /* 6) 还没排版出页 → 谈不上末页 */
+    g.list_sel = 0; g.lay.pages = NULL; g.lay.npages = 0; g.page = 0;
+    ok = ok && !reader_at_last_page() && !reader_can_go_next_answer();
+
+    g.scr = scr0; g.list_sel = sel0; g.page = page0;
+    g.list = list0; g.lay = lay0;
+    return ok;
+}
+
 
 static void list_reset(const char *title, const char *kind) {
     api_list_free(&g.list);
@@ -2760,7 +2926,13 @@ static void img_tick(void) {
         if (left > 0) doc_images_give_up();
         logmsg("图片: 后台结束，新就绪 %d 张，剩余未加载 %d 张", got, left);
         g.img_total = g.img_done = 0;
-        if (g.scr == SCR_READER || g.scr == SCR_DMREAD) draw_reader();
+        /* 1.3.8：只有真变了才重画。
+         * 原来这里无条件 draw_reader()：图片线程结束时哪怕一张都没就绪
+         * （全部命中缓存/全部失败），也会重排 + 提交一次，读一篇文章的
+         * 过程中就能看到"没动它却自己刷一下"。got>0 表示有图真的换上了，
+         * left>0 表示占位被改成了文字说明——两者都要重画；都没有就静着。 */
+        if ((got > 0 || left > 0) && (g.scr == SCR_READER || g.scr == SCR_DMREAD))
+            draw_reader();
     }
 }
 
@@ -2992,6 +3164,33 @@ static void act_question(const char *qid, const char *title) {
 static void act_open_item(ApiItem *it) {
     if (!it) return;
 
+    /* 1.3.5 模拟器专用：末页「下一个回答」端到端验证。真机没有 ZH_SIM_LIVE，
+     * 永远不会进来；这里只是把网络请求换成内置正文，让 handle_tap →
+     * reader_next_answer → act_open_item → open_doc_from_html 这条真实链路
+     * 能在离线回归里跑通并截图。 */
+    if (getenv("ZH_SIM_LIVE") && strncmp(it->id, "simnext-", 8) == 0) {
+        char html[2048];
+        int no = atoi(it->id + 8);
+        snprintf(html, sizeof(html),
+                 "<h2>【模拟回答 %d / 3】为什么Kindle上也能流畅读知乎？</h2>"
+                 "<p>这是模拟器内置的第 %d 条回答，专门用来验证：读到末页之后，"
+                 "点正中「下一个」按钮或按翻页键，能不能直接切到下一条回答。</p>"
+                 "<p>第一段：墨水屏上的知乎排版是一页一页的，问题标题完整显示，"
+                 "正文不折行、不割裂，读起来像纸书。</p>"
+                 "<p>第二段：图片异步加载，不会卡住正文；刷屏在设置里可以选 Regal，"
+                 "翻页与换屏都不闪白。</p>"
+                 "<p>第三段：热榜、推荐、搜索、收藏里的每一条都能点开读。读完末页"
+                 "接着看下一条，不必退回去重新点。</p>"
+                 "<p>第四段：返回键依然是回到这一层列表，层级分明，"
+                 "不会一下子跳回主页。</p>"
+                 "<p>第五段：这是最后一段正文，再往下翻一页就到末页，"
+                 "页脚正中会出现「下一个」按钮。</p>",
+                 no, no);
+        open_doc_from_html(it->title, "KO3 模拟器", html, 1, it->id, it->qid,
+                           100 + no, 1700000000L);
+        return;
+    }
+
     /* 没有 id 就当场说清楚，绝不发"空 id 请求"。
      * 1.2.4 点进去 404（而且响应体是空的）最可能就是这条路：
      * 链接形态没认出来 → id 空 → 请求 /api/v4/answers/ → 404。 */
@@ -3053,6 +3252,16 @@ static void act_open_item(ApiItem *it) {
 
     open_doc_from_html(title, author, html, it->type, it->id, it->qid, voteup, created);
     free(buf);
+}
+
+/* 1.3.5：末页切到列表里的下一个回答。先把选中索引推进一格，再走和点列表项
+ * 完全相同的 act_open_item 路径——这样正文、作者、赞同、图片、历史、返回层级
+ * 全部复用，不另起一套逻辑。act_open_item 内部会把 g.list_sel 当作当前项，
+ * 我们只管推进并传地址。 */
+static void reader_next_answer(void) {
+    if (!reader_has_next_answer()) return;
+    g.list_sel++;
+    act_open_item(&g.list.v[g.list_sel]);
 }
 
 /* ---------------- 我的收藏 ---------------- */
@@ -3462,6 +3671,7 @@ static void handle_tap(int x, int y) {
     if (g.scr != SCR_HOME && g.scr != SCR_MESSAGE && g.scr != SCR_LOADING) {
         int id = footer_hit(x, y);
         if (id == BTN_BACK) { handle_btn(id); return; }
+        if (id == BTN_NEXTANSWER && g.scr == SCR_READER) { reader_next_answer(); return; }
         if ((id == BTN_PREV || id == BTN_NEXT || id == BTN_REFRESH) && g.scr == SCR_LIST) {
             handle_btn(id);
             return;
@@ -3527,6 +3737,7 @@ static void handle_tap(int x, int y) {
                 if (idx >= 0 && is_tap) { img_load_one(idx); return; }
             }
             if (x < g.W / 4) reader_goto(g.page - 1);
+            else if (reader_can_go_next_answer()) reader_next_answer();  /* 1.3.5：末页点右侧→下一回答 */
             else reader_goto(g.page + 1);
             break;
         }
@@ -3540,47 +3751,31 @@ static void handle_tap(int x, int y) {
                 config_save();
                 if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
             } else if (i == 1) {
-                /* 翻页刷屏四档：全部刷新 → 局部 → Regal → 局部N次+一次全刷 */
+                /* 1.3.7：刷新模式四档——全部刷新 → 局部 → Regal → 局部N次+一次全刷。
+                 * 原「翻页刷屏」+「主界面刷屏」合并：翻页和主界面屏内更新
+                 * 共用同一档，fast/uifast 一起写，两分法两条路径都跟随它。 */
                 g_cfg.fast = (g_cfg.fast + 1) % 4;
+                g_cfg.uifast = g_cfg.fast;   /* 两项同源：主界面也用这一档 */
                 g.fb.fast_mode = g_cfg.fast;
                 g.fb.full_every = g_cfg.fullevery;
                 config_save();
                 if (g_cfg.fast == 2)
-                    show_message("翻页刷屏：Regal（不闪+补偿）。\n\nRegal 是 Kindle 的残影补偿波形"
-                                 "（REAGL，编号 0x8）。\n翻页不闪屏，且驱动会主动补偿残影。\n\n"
-                                 "部分机型的驱动不认这个波形，会自动退回局部刷新\n"
-                                 "并在 log.txt 里写明原因。");
+                    show_message("刷新模式：Regal（不闪+补偿）。\n\nRegal 是 Kindle 的残影补偿波形"
+                                 "（REAGL，编号 0x8）。\n翻页、换屏都不闪白，驱动主动补偿残影。\n\n"
+                                 "翻页和主界面共用这一档。部分机型的驱动\n"
+                                 "不认这个波形，会自动退回局部刷新并写日志。");
                 else if (g_cfg.fast == 3)
-                    show_message("翻页刷屏：局部 + 定期全刷。\n\n平时不闪（局部刷新），每 %d 次\n"
-                                 "翻页后补一次全刷清残影。\n\n周期可在 config.txt 写 fullevery=N\n"
+                    show_message("刷新模式：局部 + 定期全刷。\n\n平时不闪（局部刷新），每 %d 次\n"
+                                 "刷新后补一次全刷清残影。\n\n周期可在 config.txt 写 fullevery=N\n"
                                  "（2..20，默认 6）自行调整。", g_cfg.fullevery);
                 else if (g_cfg.fast == 0)
-                    show_message("翻页刷屏：全部刷新。\n\n每次翻页整屏闪一下（GC16 全刷），\n"
-                                 "画面最干净、永不叠残影，但翻页稍慢。");
+                    show_message("刷新模式：全部刷新。\n\n每次翻页/换屏整屏闪一下（GC16 全刷），\n"
+                                 "画面最干净、永不叠残影，但稍慢。");
                 else
-                    show_message("翻页刷屏：局部刷新。\n\n每次翻页只刷新变化部分，不闪屏、最快。\n\n"
+                    show_message("刷新模式：局部刷新。\n\n只刷新变化部分，不闪屏、最快。\n\n"
                                  "残影会慢慢攒起来，介意的话换\n「局部+定期全刷」或「Regal」。");
                 return;
             } else if (i == 2) {
-                /* 1.3.0：主界面刷屏四档——管首页/列表/设置的屏内更新
-                 * （选中移动、列表翻页）。阅读页翻页仍走「翻页刷屏」，
-                 * 两套互不影响；换屏永远全刷，不会叠屏。 */
-                g_cfg.uifast = (g_cfg.uifast + 1) % 4;
-                config_save();
-                if (g_cfg.uifast == 2)
-                    show_message("主界面刷屏：Regal（不闪+补偿）。\n\nRegal 是 Kindle 的残影补偿波形。\n\n"
-                                 "驱动不认会自动退回局部刷新并写日志。");
-                else if (g_cfg.uifast == 3)
-                    show_message("主界面刷屏：局部 + 定期全刷。\n\n平时不闪，每 %d 步补一次全刷清残影。\n\n"
-                                 "周期与「翻页刷屏」共用 config.txt 的\nfullevery=N（2..20，默认 6）。",
-                                 g_cfg.fullevery);
-                else if (g_cfg.uifast == 0)
-                    show_message("主界面刷屏：全部刷新。\n\n每一步操作整屏闪一下，最干净但稍慢。");
-                else
-                    show_message("主界面刷屏：局部刷新。\n\n选中移动、列表翻页不闪屏、最快。\n\n"
-                                 "残影会慢慢攒起来，介意的话换\n「局部+定期全刷」或「Regal」。");
-                return;
-            } else if (i == 3) {
                 g_cfg.rotate = (g_cfg.rotate + 1) % 4;
                 fb_set_rotate(&g.fb, g_cfg.rotate);
                 /* 关键：显示转了，触摸必须跟着转。
@@ -3592,7 +3787,7 @@ static void handle_tap(int x, int y) {
                 logmsg("设置: 旋转 %d°（触摸同步，物理 %dx%d）",
                        g_cfg.rotate * 90, g.fb.width, g.fb.height);
                 config_save();
-            } else if (i == 4) {
+            } else if (i == 3) {
                 g_cfg.images = (g_cfg.images + 1) % 3;
                 g.img_mode = g_cfg.images;
                 config_save();
@@ -3610,16 +3805,16 @@ static void handle_tap(int x, int y) {
                     show_message("图片：自动加载。\n\n正文先出来，图片在后台从"
                                  "第一张开始逐张下，\n补上就自动替换占位（只刷当前页）。");
                 return;
-            } else if (i == 5) {
+            } else if (i == 4) {
                 g_cfg.margin_pct = g_cfg.margin_pct >= 10 ? 4 : g_cfg.margin_pct + 3;
                 g.margin = g.W * g_cfg.margin_pct / 100;
                 config_save();
                 if (g.doc.n) reader_layout();
-            } else if (i == 6) {
+            } else if (i == 5) {
                 /* 推荐条数：6 → 12 → 18 → 6 */
                 g_cfg.rec = (g_cfg.rec == 6) ? 12 : (g_cfg.rec == 12 ? 18 : 6);
                 config_save();
-            } else if (i == 7) {
+            } else if (i == 6) {
                 /* 1.2.12：列表样式 简洁 <-> 详细，即时生效（下次画列表就用） */
                 g_cfg.liststyle = g_cfg.liststyle ? 0 : 1;
                 config_save();
@@ -3628,7 +3823,7 @@ static void handle_tap(int x, int y) {
                 else
                     show_message("列表样式：简洁。\n\n每条只显示问题标题 + 作者赞同。\n行高小、条目密，适合快速划。");
                 return;
-            } else if (i == 8) {
+            } else if (i == 7) {
                 /* 1.2.14：状态栏隐藏换成正面方案——禁 chrome pillow +
                  * SIGSTOP awesome（KOReader 真机验证多年的同款方法），
                  * 全程不碰 cvm，无 framework 看门狗风险，且即时生效。
@@ -3646,9 +3841,9 @@ static void handle_tap(int x, int y) {
                                  "（时间/网络/电量）回来了。");
                 }
                 return;
-            } else if (i == 9) {
+            } else if (i == 8) {
                 if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
-            } else if (i == 10) {
+            } else if (i == 9) {
                 long n = api_cache_clear();
                 show_message("已删除 %ld 个缓存文件\n（含图片缓存，全部文章的都清掉了）", n);
                 return;
@@ -4058,7 +4253,36 @@ static void sim_answers_demo(void) {
 }
 
 static void handle_key(int code) {
+    if (code == 987) {   /* 1.3.6：提交去重验证——连画同一页3次，日志打印跳过数。
+                          * 仅在 ZH_SIM_LIVE 下生效，真机不可达。 */
+        if (!getenv("ZH_SIM_LIVE")) return;
+        long s0 = g.present_skips, t0 = g.present_tries;
+        redraw_current(); redraw_current(); redraw_current();
+        logmsg("[diff-verify] 连画同页3次：提交尝试 %ld，跳过 %ld（应为 尝试3/跳过3）",
+               g.present_tries - t0, g.present_skips - s0);
+        return;
+    }
     if (code == 997) { sim_demo_open(); return; }
+    if (code == 988) {   /* 1.3.5：答案列表→打开第1条→跳末页，验证「下一个」按钮 */
+        if (!getenv("ZH_SIM_LIVE")) return;
+        list_reset("【末页下一回答演示】为什么Kindle上也能流畅读知乎？", "answers");
+        g.list.v = xcalloc(3, sizeof(ApiItem));
+        g.list.cap = g.list.n = 3;
+        static const char *ttls[] = { "模拟回答甲 · 三条里的第一条",
+                                      "模拟回答乙 · 三条里的第二条",
+                                      "模拟回答丙 · 三条里的第三条" };
+        for (int i = 0; i < 3; i++) {
+            snprintf(g.list.v[i].id, sizeof(g.list.v[i].id), "simnext-%d", i + 1);
+            snprintf(g.list.v[i].title, sizeof(g.list.v[i].title), "%s", ttls[i]);
+            g.list.v[i].type = 1;
+        }
+        g.list_sel = 0;
+        act_open_item(&g.list.v[0]);
+        /* 跳到末页：act_open_item 已排版好，直接把 page 放到最后 */
+        if (g.lay.npages > 0) g.page = g.lay.npages - 1;
+        draw_reader();
+        return;
+    }
     if (code == 989) {   /* 1.3.3：模拟"热榜→点问题压栈→回答列表"，验证返回回热榜 */
         if (!getenv("ZH_SIM_LIVE")) return;
         /* 父：热榜列表 */
@@ -4104,7 +4328,11 @@ static void handle_key(int code) {
                 else { img_stop(); g.scr = SCR_LIST; draw_list(); }
             }
             else if (code == 105 || code == 103 || code == 104) reader_goto(g.page - 1);
-            else if (code == 106 || code == 108 || code == 109) reader_goto(g.page + 1);
+            else if (code == 106 || code == 108 || code == 109) {
+                /* 1.3.5：末页下页键→下一回答（私信页 g.scr!=SCR_READER，自然走普通翻页） */
+                if (reader_can_go_next_answer()) reader_next_answer();
+                else reader_goto(g.page + 1);
+            }
             break;
         case SCR_DMLIST:
             if (code == 158 || code == 102) { g.scr = SCR_HOME; draw_home(); }
@@ -4369,6 +4597,7 @@ int app_run(void) {
                     input_set_rotate(ui, g.fb.width, g.fb.height);
                     layout_metrics();
                     if (g.doc.n) { reader_layout(); if (g.page >= g.lay.npages) g.page = 0; }
+                    g.present_force = 1;   /* 1.3.6：方向变了，即使签名相同也要推一帧 */
                     redraw_current();
                     present_full();
                     logmsg("旋转跟随: hw=%d -> 界面=%d°，触摸映射已同步（config.txt 可写 autorot=0 关闭）",
@@ -4396,6 +4625,11 @@ int app_run(void) {
                         int restored = (r == 1) ? fb_restore(&g.fb) : -1;
                         if (restored != 0) {
                             fb_clear(&g.fb, 255);   /* 先整屏清白，别把桌面像素留在缝里 */
+                            /* 1.3.6：这里 fb_clear 后画面和提交基准可能恰好相同
+                             * （例如整屏反白又重画回原样），守护回灌必须强制推一帧，
+                             * 否则 cvm 的残留会赖在屏上。影子回灌走 fb_restore，
+                             * 它内部直接 fb_present，不受去重影响，无需置位。 */
+                            g.present_force = 1;
                             redraw_current();
                         }
                         if (g.guard_hits <= 3 || g.guard_hits % 20 == 0)
@@ -4467,12 +4701,24 @@ int app_run(void) {
                 if (slept > 3) {
                     sleep_seen = drift;
                     logmsg("心跳: 刚挂起过 %ld 秒（累计 %ld 秒）", slept, sleep_seen);
-                    /* 挂起回来 EPDC 可能黑屏，补一次 unblank + 重画 */
-                    fb_after_resume(&g.fb);
-                    redraw_current();
+                    /* 1.3.8：**挂起回来不重画、不刷屏**。
+                     * 1.3.6 这里做的是 fb_after_resume（内部整屏 present 一次）
+                     * + present_force + redraw_current，等于每次唤醒刷两遍全屏。
+                     * Kindle 空闲时本来就在反复挂起/唤醒（framework 定时器、
+                     * RTC），于是用户"放着不动也会隔一阵闪一下"。
+                     * e-ink 双稳态：挂起不掉画面，只有驱动真丢状态才需要修，
+                     * 那由屏幕守护的逐字节比对发现，比无条件全刷精确得多。
+                     * 这里只打标记，等下一次真要刷屏时再补 unblank。 */
+                    fb_mark_resume(&g.fb);
                     /* 1.2.14：唤醒后 framework 可能重新拉起顶栏/恢复 awesome，
                      * 幂等地再压一次（statusbar_hide 内部会检查 awesome 状态） */
                     if (!g_cfg.showbar) statusbar_hide();
+                } else if (slept > 0) {
+                    /* 短挂起（Kindle 空闲时常见，几秒到十几秒）：只记账 + 打标记，
+                     * 不写日志、不碰屏幕。slept 必须在这里归零，否则若干次 1~2 秒的
+                     * 挂起会累计成一次"假的长挂起"，进而触发本不该有的动作。 */
+                    sleep_seen = drift;
+                    fb_mark_resume(&g.fb);
                 }
                 /* 列表条数和登录态一起记：真机上"页=1/0"到底是没进阅读页，
                  * 还是进了但排版结果为空，看这两个值就能区分。
@@ -4495,20 +4741,24 @@ int app_run(void) {
                     }
                 }
                 logmsg("心跳 scr=%d 页=%d/%d 列表=%d 登录=%d 内存=%ldKB 挂起=%lds "
-                       "刷新=%d eips=%d/%d 触摸=%ld 点击=%ld 抢屏=%d 开机=%lds fw=%s",
+                       "刷新=%d eips=%d/%d 触摸=%ld 点击=%ld 抢屏=%d 去重=%ld/%ld "
+                       "自动刷新=%ld 开机=%lds fw=%s",
                        g.scr, g.page + 1, g.lay.npages, g.list.n, account_has_login(),
                        rss, sleep_seen, g.fb.eink_kind, g.fb.eips_ok, g.fb.eips_fail,
                        input_event_count(), input_action_count(), g.guard_hits,
+                       g.present_skips, g.present_tries, g.idle_presents,
                        sys_uptime_sec(), fwbuf);
             }
             continue;
         }
 
         g.idle_since = now_ms_ui();
+        g.last_input_ms = g.idle_since;
         if (getenv("ZH_DEBUG")) fprintf(stderr, "[ev] type=%d x=%d y=%d code=%d scr=%d\n", ev.type, ev.x, ev.y, ev.code, g.scr);
         if (ev.type == ZH_TAP) handle_tap(ev.x, ev.y);
         else if (ev.type == ZH_SWIPE_L) {
-            if (g.scr == SCR_READER || g.scr == SCR_DMREAD) reader_goto(g.page + 1);
+            if (reader_can_go_next_answer()) reader_next_answer();  /* 1.3.5：末页左滑→下一回答 */
+            else if (g.scr == SCR_READER || g.scr == SCR_DMREAD) reader_goto(g.page + 1);
             else if (g.scr == SCR_LIST) nav_back();          /* 1.2.13：返回上一项 */
             else if (g.scr == SCR_DMLIST) { g.scr = SCR_HOME; draw_home(); }
         } else if (ev.type == ZH_SWIPE_R) {

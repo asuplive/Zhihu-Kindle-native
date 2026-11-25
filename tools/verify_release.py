@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VER = "1.3.4"
+VER = "1.3.8"
 ZIP = os.path.join(ROOT, "release", "知乎阅读-Kindle-%s.zip" % VER)
 
 ok = True
@@ -326,8 +326,8 @@ def main():
           "g.scr == SCR_LIST || g.scr == SCR_READER" in uic and
           "int ui_refresh_route_test(void)" in uic,
           "ui.c 1.3.3：刷屏两分法——列表/答案详情→翻页刷屏，其余→主界面刷屏（[ref] 自检）")
-    check("[ref  ]" in mnc and "刷屏两分法" in mnc,
-          "main.c [ref] 自检覆盖刷屏两分法全部界面")
+    check("[ref  ]" in mnc and "屏内刷新分类" in mnc,
+          "main.c [ref] 自检覆盖屏内刷新分类全部界面")
     # 1.3.4：默认 Regal + 修主界面闪（Regal 覆盖 full=1）
     check("static Config g_cfg = { 1, 2, 0, 0, 7" in uic and
           "g_cfg.uifast = 2" in uic and "strcmp(k, \"rglmig\")" in uic,
@@ -338,6 +338,50 @@ def main():
           "fb.c 1.3.4：Regal 提到波形决策最高优先级，覆盖 full=1 换屏不黑闪")
     check("int fb_refresh_wave_test(void)" in fbc and "[wav  ]" in mnc,
           "fb.c/main.c 1.3.4：[wav] 自检钉死 Regal 覆盖翻页+换屏波形规则")
+    # 1.3.5：答案阅读页末页「下一个回答」
+    check("static int reader_can_go_next_answer(void)" in uic and
+          "static void reader_next_answer(void)" in uic and
+          "footer_btn_center(BTN_NEXTANSWER" in uic,
+          "ui.c 1.3.5：末页「下一个回答」判据+切换+正中按钮")
+    check("reader_can_go_next_answer()) reader_next_answer();" in uic and
+          "id == BTN_NEXTANSWER && g.scr == SCR_READER" in uic,
+          "ui.c 1.3.5：右侧/下页键/左滑/正中按钮三条路径都切下一个")
+    check("int ui_next_answer_test(void)" in uic and "[nxt  ]" in mnc and
+          '"nextans"' in inc,
+          "ui.c/main.c/input.c 1.3.5：[nxt] 自检+nextans 注入，私信页不误切")
+    # 1.3.6：提交去重——屏幕不变不刷新
+    check("static int commit_if_changed(int full)" in uic and
+          "static int present_needed(uint32_t last, int valid, uint32_t now, int force)" in uic and
+          "fb_present(&g.fb, full);" in uic,
+          "ui.c 1.3.6：commit_if_changed 提交前比对签名，没变跳过 ioctl")
+    check("g.present_force = 1;" in uic and "g.screen_sig = g.present_sig;" in uic and
+          "去重=%ld/%ld" in uic,
+          "ui.c 1.3.6：唤醒/守护/旋转强制补刷，守护基准同步，心跳可观测")
+    check("int ui_present_diff_test(void)" in uic and "[diff ]" in mnc and
+          '"redraw"' in inc,
+          "ui.c/main.c/input.c 1.3.6：[diff] 自检+redraw 去重注入")
+    # 1.3.7：翻页刷屏+主界面刷屏合并为单一「刷新模式」
+    check('"正文字号", "刷新模式", "界面旋转", "显示图片", "页边距",' in uic and
+          "char vals[11][64]" in uic and
+          "int nrow = (int)(sizeof(names) / sizeof(names[0]))" in uic,
+          "ui.c 1.3.7：设置页删「主界面刷屏」合并为「刷新模式」，11 项自动计数")
+    check("g_cfg.uifast = g_cfg.fast;   /* 两项同源" in uic and
+          "g_cfg.fast = (g_cfg.fast + 1) % 4;" in uic and
+          "if (g_cfg.fast == 0) {   /* 1.3.7：与主界面共用同一档 */" in uic,
+          "ui.c 1.3.7：切换 fast/uifast 同源，present_screen 两路同档")
+    # 1.3.8：静止不动零刷新——挂起恢复不再整屏刷，图片线程结束不再无条件重画
+    check("void fb_mark_resume(Fb *fb)" in fbc and
+          "1.3.8：**不再 fb_present(1)**" in fbc and
+          "int fb_resume_lazy_test(void)" in fbc,
+          "fb.c 1.3.8：挂起恢复只打标记（不 unblank/不刷屏），静默回灌内存")
+    check("fb_mark_resume(&g.fb);" in uic and
+          "g.present_force = 1;\n                    redraw_current();" not in uic,
+          "ui.c 1.3.8：心跳挂起分支不再 present_force+redraw（取消每轮唤醒全刷）")
+    check("if ((got > 0 || left > 0) && (g.scr == SCR_READER" in uic,
+          "ui.c 1.3.8：图片线程结束仅在真有图就绪/占位降级时重画")
+    check("[idle ]" in mnc and "自动刷新=%ld" in uic and
+          "fb_resume_lazy_test" in mnc,
+          "main.c/ui.c 1.3.8：[idle] 自检 + 心跳「自动刷新=」静止期审计")
     check("g.scr = SCR_READER;" in uic and
           "成功路径如果不换回来" in uic,
           "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")
@@ -411,9 +455,11 @@ def main():
           "main.c [dmssr] 离线自检：合成 SSR 页面钉死提取→收割链路")
 
     # 1.3.0 专项：主界面刷屏四档 + 拼音输入法
-    check("(g_cfg.uifast + 1) % 4" in uic and "主界面刷屏" in uic and
+    # 1.3.7：两项刷屏合并为单一「刷新模式」，切换写 fast+uifast 同源；
+    # 切换语句从 (uifast+1)%4 改为 (fast+1)%4 + uifast=fast。
+    check("g_cfg.uifast = g_cfg.fast" in uic and '"刷新模式"' in uic and
           "ui_fast_next = 1" in uic,
-          "ui.c 主界面刷屏四档（设置项/切换/屏内更新标记）")
+          "ui.c 刷新模式四档（1.3.7 合并：fast/uifast 同源，屏内更新标记保留）")
     check('if (g.fast_next && g_cfg.fast)' in uic and
           'if (g.ui_fast_next)' in uic and "present_full" in uic,
           "present_screen 三路分流：阅读页翻页/主界面屏内更新/换屏全刷")
