@@ -382,6 +382,9 @@ def main():
     check("[idle ]" in mnc and "自动刷新=%ld" in uic and
           "fb_resume_lazy_test" in mnc,
           "main.c/ui.c 1.3.8：[idle] 自检 + 心跳「自动刷新=」静止期审计")
+    check("clock_gettime(CLOCK_MONOTONIC, &ts);" in uic and
+          "gettimeofday(&tv, NULL);" not in uic,
+          "ui.c 1.3.8：全部定时改用单调钟（校时跳秒不再被误判成挂起→整屏刷新）")
     check("g.scr = SCR_READER;" in uic and
           "成功路径如果不换回来" in uic,
           "ui.c img_load_one 成功路径恢复 scr（1.2.12 图片后冻结根因）")

@@ -1888,9 +1888,14 @@ static void layout_metrics(void);
 static void redraw_current(void);
 
 static long now_ms_ui(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    /* 1.3.8：改用单调时钟。原来用 gettimeofday（墙上时钟），Kindle 联网校时
+     * 一跳几秒，所有"隔多久"的判断都会错乱：提示框突然消失、屏幕守护节流
+     * 失效，最要命的是心跳的挂起检测——它比较 /proc/uptime 与这个时钟，
+     * 校时跳一下就被判成"设备睡过"，接着整屏重画一遍（真机上就是
+     * "放着不动屏幕自己闪"）。墙上时间只用于显示日期，定时一律用单调钟。 */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* 子进程干活、父进程等结果：这样联网期间界面依然能响应点击 */
